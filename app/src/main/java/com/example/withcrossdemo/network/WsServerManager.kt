@@ -1,0 +1,107 @@
+package com.example.withcrossdemo.network
+
+import com.example.withcrossdemo.data.remote.ws.StreamRepository
+import io.ktor.server.application.*
+import io.ktor.server.cio.*
+import io.ktor.server.engine.*
+import io.ktor.server.routing.*
+import io.ktor.server.websocket.*
+import io.ktor.websocket.*
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import timber.log.Timber
+import java.nio.ByteBuffer
+import javax.inject.Singleton
+import io.ktor.utils.io.core.*
+import kotlinx.coroutines.channels.consumeEach
+
+@Singleton
+class WsServerManager {
+
+    private val controlSessions = mutableSetOf<DefaultWebSocketServerSession>()
+
+    private var engine: ApplicationEngine? = null
+    private var currentPort: Int = -1
+
+
+
+    private val _modeEvents = MutableSharedFlow<Int>(
+        extraBufferCapacity = 8,
+        onBufferOverflow    = BufferOverflow.DROP_OLDEST
+    )
+    val modeEvents: SharedFlow<Int> = _modeEvents.asSharedFlow()
+
+    private var streamListener: ((Frame.Binary) -> Unit)? = null
+    fun setOnStreamBinaryListener(l: (Frame.Binary) -> Unit) {
+        streamListener = l
+    }
+
+
+    fun start(port: Int) {
+        if (engine != null && currentPort == port) return
+
+        stop() // 別ポートで動いていたら終了
+
+        Timber.i("WS-Srv: start on $port")
+
+        engine = embeddedServer(
+            CIO,
+            host = "0.0.0.0",
+            port = port,
+            configure = {
+                connectionIdleTimeoutSeconds = 10
+            }
+        ) {
+            install(WebSockets)
+
+            routing {
+                webSocket("/stream") {
+                    Timber.i("/stream connected")
+                    try {
+                        for (f in incoming) {
+                            if (f is Frame.Binary) streamListener?.invoke(f)   // ← 非ブロッキング
+                        }
+                    } catch (e: Exception) {
+                        Timber.w(e)
+                    }
+                }
+                webSocket("/control") {               // ★既存
+                    Timber.i("/control connected")
+                    controlSessions += this           // ★追加
+                    try { for (frame in incoming) { } } finally { controlSessions -= this }
+                }
+                webSocket("/mode") {
+                    Timber.i("/mode connected")
+                    for (frame in incoming) {
+                        val bytes = (frame as? Frame.Binary)?.readBytes() ?: continue   // 変更①
+                        if (bytes.size < 2) continue                                    // 変更②
+
+                        val cmd = (bytes[0].toInt() and 0xFF shl 8) or
+                                (bytes[1].toInt() and 0xFF)
+                        Timber.i("WS-Cmd recv : 0x%04X", cmd)                           // ★ログ①
+                        _modeEvents.tryEmit(cmd)
+                    }
+                }
+            }
+        }.start(wait = false)
+
+        currentPort = port
+    }
+
+    suspend fun sendControl(code: Short) {
+        val buf = ByteBuffer.allocate(2).apply { putShort(code) ; flip() }
+        controlSessions.forEach { it.send(Frame.Binary(true, buf)) }
+        Timber.i("WS-Srv: /control → 0x%04X", code.toInt() and 0xFFFF)
+    }
+
+    /** サーバー停止 */
+    fun stop() {
+        engine?.stop(gracePeriodMillis = 200, timeoutMillis = 1_000)
+        engine = null
+        currentPort = -1
+        controlSessions.clear()
+        Timber.i("WS-Srv: stop()")
+    }
+}
