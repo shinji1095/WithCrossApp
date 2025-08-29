@@ -15,7 +15,9 @@ import timber.log.Timber
 import java.nio.ByteBuffer
 import javax.inject.Singleton
 import io.ktor.utils.io.core.*
-import kotlinx.coroutines.channels.consumeEach
+import kotlinx.coroutines.*
+import java.net.DatagramPacket
+import java.net.DatagramSocket
 
 @Singleton
 class WsServerManager {
@@ -25,7 +27,11 @@ class WsServerManager {
     private var engine: ApplicationEngine? = null
     private var currentPort: Int = -1
 
-
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var udpSocket: DatagramSocket? = null
+    private var udpJob: Job? = null
+    private var udpListener: ((ByteArray) -> Unit)? = null
+    fun setOnUdpPacketListener(l: (ByteArray) -> Unit) { udpListener = l }
 
     private val _modeEvents = MutableSharedFlow<Int>(
         extraBufferCapacity = 8,
@@ -87,7 +93,31 @@ class WsServerManager {
             }
         }.start(wait = false)
 
+        startUdp(port)
         currentPort = port
+    }
+
+    // ▼ 追加: UDP 受信ループ
+    private fun startUdp(port: Int) {
+        udpJob?.cancel()
+        udpSocket?.close()
+        udpJob = scope.launch {
+            try {
+                DatagramSocket(port).use { s ->
+                    udpSocket = s
+                    Timber.i("UDP-Srv: start on $port")
+                    val buf = ByteArray(65507) // 最大安全ペイロード
+                    while (isActive) {
+                        val p = DatagramPacket(buf, buf.size)
+                        s.receive(p)
+                        val bytes = p.data.copyOf(p.length) // 受信サイズぶんを切り出し
+                        udpListener?.invoke(bytes)
+                    }
+                }
+            } catch (e: Exception) {
+                Timber.e(e, "UDP-Srv error")
+            }
+        }
     }
 
     suspend fun sendControl(code: Short) {
@@ -102,6 +132,11 @@ class WsServerManager {
         engine = null
         currentPort = -1
         controlSessions.clear()
+        // ▼ 追加: UDP 停止処理
+        udpJob?.cancel()
+        udpSocket?.close()
+        udpJob = null
+        udpSocket = null
         Timber.i("WS-Srv: stop()")
     }
 }

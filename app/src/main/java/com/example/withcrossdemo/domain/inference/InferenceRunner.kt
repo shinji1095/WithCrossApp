@@ -62,6 +62,21 @@ class InferenceRunner<T : Any>(
         return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
     }
 
+    // 追加: スキップ用の内部例外（ログは Warn に落とす）
+    private class SkipFrame(msg: String) : RuntimeException(msg)
+
+    // InferenceRunner.kt
+    private fun decodeDownsampledOrNull(bytes: ByteArray, reqW: Int, reqH: Int): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        val opts = BitmapFactory.Options().apply {
+            inSampleSize = calcInSampleSize(bounds.outWidth, bounds.outHeight, reqW, reqH)
+            inPreferredConfig = Bitmap.Config.ARGB_8888   // ★ここをRGB_565→ARGB_8888に
+        }
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+    }
+
+
     fun start() {
         job?.cancel()
         job = scope.launch(Dispatchers.Default) {
@@ -69,24 +84,22 @@ class InferenceRunner<T : Any>(
 
             jpegFlow
                 .mapLatest { bytes ->
-                    // ★ダウンサンプリングしてデコード
                     val bmp = withContext(Dispatchers.Default) {
-                        val b = decodeDownsampled(
-                            bytes,
-                            modelCfg.inputWidth,
-                            modelCfg.inputHeight,
-                            Bitmap.Config.ARGB_8888
-                        )
-                        // 万一ドライバなどで別Configになっても安全側にコピー
-                        if (b.config != Bitmap.Config.ARGB_8888) b.copy(Bitmap.Config.ARGB_8888, false) else b
-                    }
+                        decodeDownsampledOrNull(bytes, modelCfg.inputWidth, modelCfg.inputHeight)
+                    } ?: throw SkipFrame("decodeByteArray returned null")
                     val raw    = processor.run(tflite, processor.preprocess(bmp))
                     val output = processor.postprocess(raw)
                     Timber.d("AI raw=%s → out=%s", raw, output)
                     @Suppress("UNCHECKED_CAST")
                     output
                 }
-                .catch { e -> Timber.e(e, "推論中に例外") }
+                .catch { e ->
+                    if (e is SkipFrame) {
+                        Timber.w("Skip frame: %s", e.message)
+                    } else {
+                        Timber.e(e, "推論中に例外")
+                    }
+                }
                 .collect { out -> processor.handleResult(out) }
         }
     }

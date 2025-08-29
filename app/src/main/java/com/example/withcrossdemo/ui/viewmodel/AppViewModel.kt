@@ -10,7 +10,6 @@ import com.example.withcrossdemo.data.remote.ws.StreamRepository
 import com.example.withcrossdemo.domain.inference.*
 import com.example.withcrossdemo.domain.model.Detection
 import com.example.withcrossdemo.domain.model.SignalState
-import com.example.withcrossdemo.domain.model.SignalState.*
 import com.example.withcrossdemo.network.WsServerManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.*
@@ -19,6 +18,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import timber.log.Timber
 import javax.inject.Inject
+import com.example.withcrossdemo.core.util.UdpJpegReassembler
+import kotlinx.coroutines.launch  // 未importなら
 
 enum class RunMode { HOME, SIGNAL, STRAIGHT, OBJECT }
 
@@ -53,23 +54,33 @@ class AppViewModel @Inject constructor(
     /* ---------------- MediaPlayer ---------------- */
     private var player: MediaPlayer? = null
 
+    private val udpReasm = UdpJpegReassembler(
+        onFrame = { frame -> streamRepo.onBytes(frame) },
+        maxFrameBytes = 1_500_000
+    )
+
+
     /* ---------------- 初期化 ---------------- */
     init {
         viewModelScope.launch {
-            val port = settingRepo.settingFlow
-                .first { it.port.isNotBlank() }.port
-            ws.start(port.toInt())
+            val port = settingRepo.settingFlow.first { it.port.isNotBlank() }.port
+            ws.start(port.toInt())  // WS(制御/モード) + UDP(ストリーム) を起動【既存】
 
-            // ① JPEG は流すだけ
-            ws.setOnStreamBinaryListener { frame ->
-                streamRepo.onBinary(frame)      // 即復帰・詰まらない
+            // ▼ 追加: UDP 映像ストリーム
+            ws.setOnUdpPacketListener { bytes ->
+                udpReasm.feed(bytes)  // 即復帰・詰まらない
             }
 
-            // ② /mode コマンドは独立したコルーチンで監視
-            launch {
-                ws.modeEvents.collect { cmd ->
-                    handleModeCommand(cmd)          // 下記に分離
+            // （フォールバック）WS /stream を受ける場合も引き続き対応
+            ws.setOnStreamBinaryListener { frame ->
+                viewModelScope.launch {
+                    streamRepo.onBinary(frame)
                 }
+            }
+
+            // 既存: /mode コマンド監視
+            launch {
+                ws.modeEvents.collect { cmd -> handleModeCommand(cmd) }
             }
         }
     }
