@@ -19,7 +19,15 @@ import kotlinx.coroutines.sync.withLock
 import timber.log.Timber
 import javax.inject.Inject
 import com.example.withcrossdemo.core.util.UdpJpegReassembler
-import kotlinx.coroutines.launch  // 未importなら
+import kotlinx.coroutines.launch
+// import に以下が必要な場合は追加
+import kotlinx.coroutines.flow.sample
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.Date
+import android.os.Environment
+
 
 enum class RunMode { HOME, SIGNAL, STRAIGHT, OBJECT }
 
@@ -58,6 +66,11 @@ class AppViewModel @Inject constructor(
         onFrame = { frame -> streamRepo.onBytes(frame) },
         maxFrameBytes = 1_500_000
     )
+
+    /* ---------- 画像保存 on/off ---------- */
+    private val _saveImages = MutableStateFlow(false)
+    val saveImages: StateFlow<Boolean> = _saveImages.asStateFlow()
+    private var saveJob: Job? = null
 
 
     /* ---------------- 初期化 ---------------- */
@@ -236,5 +249,39 @@ class AppViewModel @Inject constructor(
             runner?.stop()
             signalVoiceJob?.cancel()
             player?.release()
+            stopSaving()
         }
-    }
+
+        fun setSaveImagesEnabled(enabled: Boolean) {
+            if (_saveImages.value == enabled) return
+            _saveImages.value = enabled
+            if (enabled) startSaving() else stopSaving()
+        }
+
+        private fun startSaving() {
+            stopSaving() // 二重起動防止
+            saveJob = viewModelScope.launch(Dispatchers.IO) {
+                val base = app.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+                val dir = File(base, "stream").apply { mkdirs() }
+                val sdf = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US)
+
+                // 1秒に1枚、最新フレームのみ保存
+                streamRepo.jpegFlow
+                    .sample(1000)
+                    .collect { bytes ->
+                        try {
+                            val name = "${sdf.format(Date())}.jpg"
+                            File(dir, name).outputStream().use { it.write(bytes) }
+                            Timber.d("Saved JPEG: %s (%dB)", name, bytes.size)
+                        } catch (e: Exception) {
+                            Timber.e(e, "Save failed")
+                        }
+                    }
+            }
+        }
+
+        private fun stopSaving() {
+            saveJob?.cancel()
+            saveJob = null
+        }
+}
