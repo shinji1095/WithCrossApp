@@ -12,6 +12,7 @@ plugins {
 android {
     namespace   = "com.example.withcrossdemo"
     compileSdk  = 35
+    ndkVersion = "25.2.9519653"
 
     defaultConfig {
         applicationId = "com.example.withcrossdemo"
@@ -21,23 +22,23 @@ android {
         versionName   = "1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
+
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
+
+        externalNativeBuild {
+            ndkBuild {
+                arguments += listOf("GSTREAMER_ROOT_ANDROID=$gstRoot")
+            }
+        }
     }
 
     buildTypes {
         debug {
             isDebuggable = true
         }
-//        release {
-//            isMinifyEnabled = false
-//            proguardFiles(
-//                getDefaultProguardFile("proguard-android-optimize.txt"),
-//                "proguard-rules.pro"
-//            )
-//        }
     }
-
-
-
     buildFeatures {
         compose = true
         buildConfig = true
@@ -122,3 +123,8 @@ configurations.configureEach {
 }
 
 kapt { correctErrorTypes = true }
+// --- GStreamer root を取得（gradle.properties > 環境変数 の優先順）---
+val gstRootProp = (findProperty("gstAndroidRoot") as String?)
+    ?: System.getenv("GSTREAMER_ROOT_ANDROID")
+val gstRoot = gstRootProp?.replace("\\", "/")
+    ?: throw GradleException("Set 'gstAndroidRoot' in gradle.properties or 'GSTREAMER_ROOT_ANDROID' env var")

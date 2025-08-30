@@ -30,6 +30,7 @@ import android.os.Environment
 
 
 enum class RunMode { HOME, SIGNAL, STRAIGHT, OBJECT }
+enum class InputSource { UDP_JPEG, GST_RTP_JPEG, GST_RTSP_JPEG }
 
 @HiltViewModel
 class AppViewModel @Inject constructor(
@@ -38,7 +39,6 @@ class AppViewModel @Inject constructor(
     private val modelManager: TfliteModelManager,
     settingRepo: SettingRepository
 ) : AndroidViewModel(app) {
-
     /* ---------------- Stream (JPEG) ---------------- */
     private val streamRepo = StreamRepository()
     val jpegFlow = streamRepo.jpegFlow
@@ -72,6 +72,44 @@ class AppViewModel @Inject constructor(
     val saveImages: StateFlow<Boolean> = _saveImages.asStateFlow()
     private var saveJob: Job? = null
 
+    /* ---------- GStreamer ---------- */
+    private val _inputSource = MutableStateFlow(InputSource.UDP_JPEG)
+    val inputSource: StateFlow<InputSource> = _inputSource.asStateFlow()
+
+    private val _gstStats = MutableStateFlow<com.example.withcrossdemo.gst.GstReceiver.Stats?>(null)
+    val gstStats: StateFlow<com.example.withcrossdemo.gst.GstReceiver.Stats?> = _gstStats.asStateFlow()
+
+    private val _rtpListenPort = MutableStateFlow(5000)
+    val rtpListenPort: StateFlow<Int> = _rtpListenPort.asStateFlow()
+
+    private val _rtspUrl = MutableStateFlow("rtsp://192.168.4.1:8554/stream")
+    val rtspUrl: StateFlow<String> = _rtspUrl.asStateFlow()
+
+    private var gstReceiver: com.example.withcrossdemo.gst.GstReceiver? = null
+
+    fun selectInputSource(src: InputSource) { /*…（RTP/RTSP起動 or 停止）…*/ }
+    fun setRtpPort(port: Int) { _rtpListenPort.value = port }
+    fun setRtspUrl(url: String) { _rtspUrl.value = url }
+
+    private fun startGStreamerRtp() {
+        val port = _rtpListenPort.value
+        gstReceiver = com.example.withcrossdemo.gst.GstReceiver(
+            onJpegFrame = { bytes -> streamRepo.onBytes(bytes) },  // 既存フローに合流
+            onDebug     = { msg -> Timber.d(msg) }
+        ).also { it.startRtpJpegUdp(port) }
+    }
+
+    private fun startGStreamerRtsp() {
+        val url = _rtspUrl.value
+        gstReceiver = com.example.withcrossdemo.gst.GstReceiver(
+            onJpegFrame = { bytes -> streamRepo.onBytes(bytes) },
+            onDebug     = { msg -> Timber.d(msg) }
+        ).also { it.startRtspJpegUdp(url) }
+    }
+
+
+    private fun stopGStreamer() { /* 停止処理 */ }
+
 
     /* ---------------- 初期化 ---------------- */
     init {
@@ -81,7 +119,9 @@ class AppViewModel @Inject constructor(
 
             // ▼ 追加: UDP 映像ストリーム
             ws.setOnUdpPacketListener { bytes ->
-                udpReasm.feed(bytes)  // 即復帰・詰まらない
+                if (_inputSource.value == InputSource.UDP_JPEG) {
+                    udpReasm.feed(bytes)
+                }
             }
 
             // （フォールバック）WS /stream を受ける場合も引き続き対応
@@ -250,6 +290,7 @@ class AppViewModel @Inject constructor(
             signalVoiceJob?.cancel()
             player?.release()
             stopSaving()
+            stopGStreamer()
         }
 
         fun setSaveImagesEnabled(enabled: Boolean) {

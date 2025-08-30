@@ -33,6 +33,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import com.example.withcrossdemo.ui.viewmodel.InputSource
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -178,17 +179,58 @@ fun AppScreen(
                     )
                 } ?: Text("画像がまだ届いていません…", style = MaterialTheme.typography.bodySmall)
 
-                OutlinedTextField(
-                    value = mode.name,
-                    onValueChange = {},
-                    label = { Text("受信コマンド") },
-                    readOnly = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+                // 既存の debugOn == true の中など、デバッグ表示の近辺に追記
+                val inputSrc by vm.inputSource.collectAsState()
+                val gstStats by vm.gstStats.collectAsState(null)
+                val rtpPort by vm.rtpListenPort.collectAsState()
+                val rtspUrl by vm.rtspUrl.collectAsState()
+                val gstStatsState = vm.gstStats.collectAsState(initial = null)
+
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Input:", modifier = Modifier.padding(end = 8.dp))
+                    AssistChip(onClick = { vm.selectInputSource(InputSource.UDP_JPEG) }, label = { Text("UDP/JPEG") })
+                    Spacer(Modifier.width(8.dp))
+                    AssistChip(onClick = { vm.selectInputSource(InputSource.GST_RTP_JPEG) }, label = { Text("GST RTP/JPEG") })
+                    Spacer(Modifier.width(8.dp))
+                    AssistChip(onClick = { vm.selectInputSource(InputSource.GST_RTSP_JPEG) }, label = { Text("GST RTSP/JPEG") })
+                }
+                Text("選択中: $inputSrc", style = MaterialTheme.typography.bodySmall)
+
+                if (inputSrc == InputSource.GST_RTP_JPEG) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(
+                            value = rtpPort.toString(),
+                            onValueChange = { it.toIntOrNull()?.let(vm::setRtpPort) },
+                            label = { Text("RTP Listen Port") },
+                            modifier = Modifier.weight(1f)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Button(onClick = { vm.selectInputSource(InputSource.GST_RTP_JPEG) }) { Text("再接続") }
+                    }
+                } else if (inputSrc == InputSource.GST_RTSP_JPEG) {
+                    OutlinedTextField(
+                        value = rtspUrl,
+                        onValueChange = vm::setRtspUrl,
+                        label = { Text("RTSP URL (JPEG over RTP/UDP)") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        Button(onClick = { vm.selectInputSource(InputSource.GST_RTSP_JPEG) }) { Text("再接続") }
+                    }
+                }
+
+                gstStats?.let { st ->
+                    Text(
+                        "GST fps=%.1f, avgΔ=%.1fms, jitter=%.1fms"
+                            .format(st.framesPerSec, st.avgDeltaMs, st.jitterMs),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text("Pipeline: ${st.pipeline}", style = MaterialTheme.typography.bodySmall)
+                }
+
 
                 Divider()
             }
-
             /* ---------- ログ ---------- */
             LazyColumn(Modifier.weight(1f)) {
                 items(logs) { line ->

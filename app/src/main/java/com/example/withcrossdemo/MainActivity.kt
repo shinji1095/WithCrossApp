@@ -15,10 +15,19 @@ import com.example.withcrossdemo.ui.nav.Screen
 import com.example.withcrossdemo.ui.screen.*
 import dagger.hilt.android.AndroidEntryPoint
 
+
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // onCreate 内の先頭あたりに追加（重複ロードは安全です）
+        try {
+            System.loadLibrary("gstreamer_android")
+            System.loadLibrary("gstbridge")   // ← 後述のJNIブリッジSO
+        } catch (t: Throwable) {
+            t.printStackTrace()
+            // 既存のエラーハンドリングに合わせて必要なら finish() など
+        }
         setContent {
             MaterialTheme {
                 Surface {
