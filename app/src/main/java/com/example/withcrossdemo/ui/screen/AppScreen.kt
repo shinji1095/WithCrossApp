@@ -53,7 +53,6 @@ fun AppScreen(
     var uiBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
     // ==== 追加: 保存トグル ====
-    // 端末回転でも維持したいので rememberSaveable
     var saveImagesOn by rememberSaveable { mutableStateOf(false) }
     val ctx = LocalContext.current
     val saveDir = remember {
@@ -63,28 +62,23 @@ fun AppScreen(
     val saveDirPath = remember { saveDir.absolutePath }
     val sdf = remember { SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US) }
 
-    // ==== 既存: デバッグ用Bitmap描画 ====
-    // debugOn が true の間だけ UI 表示用に Bitmap 化
+    // ==== デバッグ用Bitmap描画 ====
     LaunchedEffect(debugOn) {
         uiBitmap = null
         if (!debugOn) return@LaunchedEffect
         jpegFlow
             .mapLatest { bytes ->
                 withContext(Dispatchers.Default) {
-                    // UI 用は軽量化（RGB_565）
-                    val opts = BitmapFactory.Options().apply {
-                        inPreferredConfig = Bitmap.Config.RGB_565
-                    }
+                    val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.RGB_565 }
                     BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
                 }
             }
             .collect { bmp -> uiBitmap = bmp }
     }
 
-    // ==== 追加: 1秒間隔での保存処理（デバッグ表示と独立）====
+    // ==== 1秒間隔の保存 ====
     LaunchedEffect(saveImagesOn) {
         if (!saveImagesOn) return@LaunchedEffect
-        // 1秒に1枚、直近の最新フレームのみ保存
         jpegFlow
             .sample(1000)
             .collectLatest { bytes ->
@@ -100,7 +94,7 @@ fun AppScreen(
             }
     }
 
-    // ログにモード変化を追記（既存）
+    // モード変化ログ
     LaunchedEffect(mode) { logs.add("MODE → ${mode.name}") }
 
     Scaffold(
@@ -115,132 +109,139 @@ fun AppScreen(
             )
         }
     ) { inner ->
-        Column(
+        LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(inner)
-                .padding(8.dp),
+                .padding(inner),
+            contentPadding = PaddingValues(8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            /* ---------- トグル & 状態 ---------- */
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("デバッグ出力")
-                Spacer(Modifier.width(8.dp))
-                Switch(checked = debugOn, onCheckedChange = { debugOn = it })
+            // ---------- トグル & 状態 ----------
+            item {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("デバッグ出力")
+                    Spacer(Modifier.width(8.dp))
+                    Switch(checked = debugOn, onCheckedChange = { debugOn = it })
+                }
+            }
+            item {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("画像保存(1秒おき)")
+                    Spacer(Modifier.width(8.dp))
+                    Switch(checked = saveImagesOn, onCheckedChange = { saveImagesOn = it })
+                }
+            }
+            item {
+                if (saveImagesOn) {
+                    Text("保存先: $saveDirPath", style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            item {
+                Text("現在モード: ${mode.name}")
             }
 
-            // ==== 追加: 画像保存トグル ====
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("画像保存(1秒おき)")
-                Spacer(Modifier.width(8.dp))
-                Switch(
-                    checked = saveImagesOn,
-                    onCheckedChange = { saveImagesOn = it }
-                )
-            }
-            if (saveImagesOn) {
-                Text(
-                    "保存先: $saveDirPath",
-                    style = MaterialTheme.typography.bodySmall
-                )
+            item {
+                if (mode == RunMode.OBJECT) {
+                    TextField(
+                        value = labels,
+                        onValueChange = {},
+                        label = { Text("検知ラベル") },
+                        readOnly = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             }
 
-            Text("現在モード: ${mode.name}")
-
-            if (mode == RunMode.OBJECT) {
-                TextField(
-                    value = labels,
-                    onValueChange = {},
-                    label = { Text("検知ラベル") },
-                    readOnly = true,
+            item {
+                OutlinedTextField(
+                    value = csvName,
+                    onValueChange = { csvName = it },
+                    label = { Text("CSV ファイル名") },
                     modifier = Modifier.fillMaxWidth()
                 )
             }
 
-            OutlinedTextField(
-                value = csvName,
-                onValueChange = { csvName = it },
-                label = { Text("CSV ファイル名") }
-            )
-
-            Button(onClick = { Timber.i("TODO: export CSV $csvName") }) { Text("CSV 出力") }
-
-            Divider()
-
-            /* ---------- デバッグ UI ---------- */
-            if (debugOn) {
-                uiBitmap?.let { bmp ->
-                    Image(
-                        bitmap = bmp.asImageBitmap(),
-                        contentDescription = "stream frame",
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .aspectRatio(bmp.width / bmp.height.toFloat())
-                    )
-                } ?: Text("画像がまだ届いていません…", style = MaterialTheme.typography.bodySmall)
-
-                // 既存の debugOn == true の中など、デバッグ表示の近辺に追記
-                val inputSrc by vm.inputSource.collectAsState()
-                val gstStats by vm.gstStats.collectAsState(null)
-                val rtpPort by vm.rtpListenPort.collectAsState()
-                val rtspUrl by vm.rtspUrl.collectAsState()
-                val gstStatsState = vm.gstStats.collectAsState(initial = null)
-
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text("Input:", modifier = Modifier.padding(end = 8.dp))
-                    AssistChip(onClick = { vm.selectInputSource(InputSource.UDP_JPEG) }, label = { Text("UDP/JPEG") })
-                    Spacer(Modifier.width(8.dp))
-                    AssistChip(onClick = { vm.selectInputSource(InputSource.GST_RTP_JPEG) }, label = { Text("GST RTP/JPEG") })
-                    Spacer(Modifier.width(8.dp))
-                    AssistChip(onClick = { vm.selectInputSource(InputSource.GST_RTSP_JPEG) }, label = { Text("GST RTSP/JPEG") })
-                }
-                Text("選択中: $inputSrc", style = MaterialTheme.typography.bodySmall)
-
-                if (inputSrc == InputSource.GST_RTP_JPEG) {
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        OutlinedTextField(
-                            value = rtpPort.toString(),
-                            onValueChange = { it.toIntOrNull()?.let(vm::setRtpPort) },
-                            label = { Text("RTP Listen Port") },
-                            modifier = Modifier.weight(1f)
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Button(onClick = { vm.selectInputSource(InputSource.GST_RTP_JPEG) }) { Text("再接続") }
-                    }
-                } else if (inputSrc == InputSource.GST_RTSP_JPEG) {
-                    OutlinedTextField(
-                        value = rtspUrl,
-                        onValueChange = vm::setRtspUrl,
-                        label = { Text("RTSP URL (JPEG over RTP/UDP)") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                        Button(onClick = { vm.selectInputSource(InputSource.GST_RTSP_JPEG) }) { Text("再接続") }
-                    }
-                }
-
-                gstStats?.let { st ->
-                    Text(
-                        "GST fps=%.1f, avgΔ=%.1fms, jitter=%.1fms"
-                            .format(st.framesPerSec, st.avgDeltaMs, st.jitterMs),
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    Text("Pipeline: ${st.pipeline}", style = MaterialTheme.typography.bodySmall)
-                }
-
-
-                Divider()
+            item {
+                Button(onClick = { Timber.i("TODO: export CSV $csvName") }) { Text("CSV 出力") }
             }
-            /* ---------- ログ ---------- */
-            LazyColumn(Modifier.weight(1f)) {
-                items(logs) { line ->
-                    Text(line, style = MaterialTheme.typography.bodySmall)
+
+            item { Divider() }
+
+            // ---------- デバッグ UI ----------
+            item {
+                if (debugOn) {
+                    uiBitmap?.let { bmp ->
+                        Image(
+                            bitmap = bmp.asImageBitmap(),
+                            contentDescription = "stream frame",
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .aspectRatio(bmp.width / bmp.height.toFloat())
+                        )
+                    } ?: Text("画像がまだ届いていません…", style = MaterialTheme.typography.bodySmall)
+
+                    val inputSrc by vm.inputSource.collectAsState()
+                    val gstStats by vm.gstStats.collectAsState()
+                    val rtpPort by vm.rtpListenPort.collectAsState()
+                    val rtspUrl by vm.rtspUrl.collectAsState()
+
+                    Spacer(Modifier.height(8.dp))
+
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Input:", modifier = Modifier.padding(end = 8.dp))
+                        AssistChip(onClick = { vm.selectInputSource(InputSource.UDP_JPEG) }, label = { Text("UDP/JPEG") })
+                        Spacer(Modifier.width(8.dp))
+                        AssistChip(onClick = { vm.selectInputSource(InputSource.GST_RTP_JPEG) }, label = { Text("GST RTP/JPEG") })
+                        Spacer(Modifier.width(8.dp))
+                        AssistChip(onClick = { vm.selectInputSource(InputSource.GST_RTSP_JPEG) }, label = { Text("GST RTSP/JPEG") })
+                    }
+                    Text("選択中: $inputSrc", style = MaterialTheme.typography.bodySmall)
+
+                    if (inputSrc == InputSource.GST_RTP_JPEG) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            OutlinedTextField(
+                                value = rtpPort.toString(),
+                                onValueChange = { it.toIntOrNull()?.let(vm::setRtpPort) },
+                                label = { Text("RTP Listen Port") },
+                                modifier = Modifier.weight(1f)
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Button(onClick = { vm.selectInputSource(InputSource.GST_RTP_JPEG) }) { Text("再接続") }
+                        }
+                    } else if (inputSrc == InputSource.GST_RTSP_JPEG) {
+                        OutlinedTextField(
+                            value = rtspUrl,
+                            onValueChange = vm::setRtspUrl,
+                            label = { Text("RTSP URL (JPEG over RTP/UDP)") },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                            Button(onClick = { vm.selectInputSource(InputSource.GST_RTSP_JPEG) }) { Text("再接続") }
+                        }
+                    }
+
+                    gstStats?.let { st ->
+                        Text(
+                            "GST fps=%.1f, avgΔ=%.1fms, jitter=%.1fms"
+                                .format(st.framesPerSec, st.avgDeltaMs, st.jitterMs),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Text("Pipeline: ${st.pipeline}", style = MaterialTheme.typography.bodySmall)
+                    }
+
+                    Divider()
                 }
+            }
+
+            // ---------- ログ ----------
+            item { Text("ログ", style = MaterialTheme.typography.titleSmall) }
+            items(logs) { line ->
+                Text(line, style = MaterialTheme.typography.bodySmall)
+            }
+
+            if (BuildConfig.DEBUG) {
+                item { Text("MODE = $mode", Modifier.padding(4.dp)) }
             }
         }
-    }
-
-    if (BuildConfig.DEBUG) {
-        Text("MODE = $mode", Modifier.padding(4.dp))
     }
 }

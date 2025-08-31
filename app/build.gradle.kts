@@ -9,10 +9,25 @@ plugins {
     id("io.ktor.plugin") version "2.3.6" apply false
 }
 
+/* ─────★ 追加/移動: GStreamer Android ルートを先に解決 ───── */
+val gstRootProp = (findProperty("gstAndroidRoot") as String?)
+    ?: System.getenv("GSTREAMER_ROOT_ANDROID")
+val gstRoot = gstRootProp?.replace("\\", "/")
+    ?: throw GradleException(
+        "Set 'gstAndroidRoot' in gradle.properties or 'GSTREAMER_ROOT_ANDROID' env var"
+    )
+/* ─────────────────────────────────────────────────────────── */
+
 android {
     namespace   = "com.example.withcrossdemo"
     compileSdk  = 35
-    ndkVersion = "25.2.9519653"
+    ndkVersion  = "25.2.9519653"
+
+    externalNativeBuild {
+        ndkBuild {
+            path = file("src/main/jni/Android.mk")
+        }
+    }
 
     defaultConfig {
         applicationId = "com.example.withcrossdemo"
@@ -23,22 +38,28 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
 
-        ndk {
-            abiFilters += listOf("arm64-v8a")
-        }
-
         externalNativeBuild {
             ndkBuild {
-                arguments += listOf("GSTREAMER_ROOT_ANDROID=$gstRoot")
+                // “gstreamer_android” をターゲットから外し、gstbridge のみを明示
+                targets.clear()
+                targets.add("gstbridge")
+
+                // 引数・ABI の指定も Kotlin 風に
+                arguments += listOf(
+                    "GSTREAMER_ROOT_ANDROID=C:/gstreamer-1.0-android-universal-1.26.5"
+                )
+                abiFilters += listOf("arm64-v8a")
             }
+        }
+        ndk {
+            abiFilters += listOf("arm64-v8a")
         }
     }
 
     buildTypes {
-        debug {
-            isDebuggable = true
-        }
+        debug { isDebuggable = true }
     }
+
     buildFeatures {
         compose = true
         buildConfig = true
@@ -60,6 +81,11 @@ android {
         freeCompilerArgs += "-Xjvm-default=all"
     }
 
+    // ──★ 追加: JNI ライブラリのパッケージングをレガシー形式に（ndk-build 連携が安定）
+    packaging {
+        jniLibs { useLegacyPackaging = true }  // ★ 追加
+    }
+    // 既存の excludes はこのままでOK（重複していても害はありません）
     packaging.resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
 }
 
@@ -86,13 +112,12 @@ dependencies {
     implementation("io.ktor:ktor-server-cio:2.3.6")
     implementation("io.ktor:ktor-server-websockets:2.3.6")
 
-
     /* ───────────── 追加ライブラリ ────── */
     implementation("com.jakewharton.timber:timber:5.0.1")
     implementation("androidx.activity:activity-ktx:1.9.0")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.navigation:navigation-compose:2.8.0")
-    implementation(libs.material)                         // Google Material Components
+    implementation(libs.material)
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("com.google.dagger:hilt-android:${libs.versions.hilt.get()}")
@@ -100,10 +125,13 @@ dependencies {
     implementation("no.nordicsemi.android.support.v18:scanner:1.6.0")
     implementation("com.squareup.okhttp3:okhttp:5.0.0-alpha.14")
     implementation("com.github.doyaaaaaken:kotlin-csv-jvm:1.9.3")
+
+    // TFLite / LiteRT（既存を維持）
     implementation("com.google.ai.edge.litert:litert:1.4.0")
     implementation("com.google.ai.edge.litert:litert-support:1.4.0")
     implementation("com.google.ai.edge.litert:litert-gpu:1.4.0")
     implementation("io.github.google-ai-edge:litert-select-tf-ops:0.1.0")
+
     implementation("com.google.accompanist:accompanist-permissions:0.34.0")
 
     /* ───────────── テスト ───────────── */
@@ -123,8 +151,3 @@ configurations.configureEach {
 }
 
 kapt { correctErrorTypes = true }
-// --- GStreamer root を取得（gradle.properties > 環境変数 の優先順）---
-val gstRootProp = (findProperty("gstAndroidRoot") as String?)
-    ?: System.getenv("GSTREAMER_ROOT_ANDROID")
-val gstRoot = gstRootProp?.replace("\\", "/")
-    ?: throw GradleException("Set 'gstAndroidRoot' in gradle.properties or 'GSTREAMER_ROOT_ANDROID' env var")

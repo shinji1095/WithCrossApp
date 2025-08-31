@@ -19,15 +19,12 @@ import kotlinx.coroutines.sync.withLock
 import timber.log.Timber
 import javax.inject.Inject
 import com.example.withcrossdemo.core.util.UdpJpegReassembler
-import kotlinx.coroutines.launch
-// import に以下が必要な場合は追加
-import kotlinx.coroutines.flow.sample
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.Date
 import android.os.Environment
-
+import com.example.withcrossdemo.gst.GstReceiver
 
 enum class RunMode { HOME, SIGNAL, STRAIGHT, OBJECT }
 enum class InputSource { UDP_JPEG, GST_RTP_JPEG, GST_RTSP_JPEG }
@@ -57,11 +54,12 @@ class AppViewModel @Inject constructor(
     /* ---------------- 1.5 秒ごとの信号音声 ---------------- */
     private val lastStates = ArrayDeque<SignalState>()   // 最新 3 フレーム
     private val mutex = Mutex()
-    private var signalVoiceJob: Job? = null
+    private var signalVoiceJob: Job? = null   // ← 重複定義を一本化
 
     /* ---------------- MediaPlayer ---------------- */
     private var player: MediaPlayer? = null
 
+    /* ----------------（旧）生UDP MJPEGリアセンブラ（※使わないが残す） ---------------- */
     private val udpReasm = UdpJpegReassembler(
         onFrame = { frame -> streamRepo.onBytes(frame) },
         maxFrameBytes = 1_500_000
@@ -73,83 +71,155 @@ class AppViewModel @Inject constructor(
     private var saveJob: Job? = null
 
     /* ---------- GStreamer ---------- */
-    private val _inputSource = MutableStateFlow(InputSource.UDP_JPEG)
+    private val _inputSource = MutableStateFlow(InputSource.GST_RTP_JPEG)
     val inputSource: StateFlow<InputSource> = _inputSource.asStateFlow()
 
-    private val _gstStats = MutableStateFlow<com.example.withcrossdemo.gst.GstReceiver.Stats?>(null)
-    val gstStats: StateFlow<com.example.withcrossdemo.gst.GstReceiver.Stats?> = _gstStats.asStateFlow()
+    private val _gstStats = MutableStateFlow<GstReceiver.Stats?>(null)
+    val gstStats: StateFlow<GstReceiver.Stats?> = _gstStats.asStateFlow()
 
-    private val _rtpListenPort = MutableStateFlow(5000)
+    private val _rtpListenPort = MutableStateFlow(5540)
     val rtpListenPort: StateFlow<Int> = _rtpListenPort.asStateFlow()
 
     private val _rtspUrl = MutableStateFlow("rtsp://192.168.4.1:8554/stream")
     val rtspUrl: StateFlow<String> = _rtspUrl.asStateFlow()
 
-    private var gstReceiver: com.example.withcrossdemo.gst.GstReceiver? = null
+    private var gstReceiver: GstReceiver? = null
+    private var gstStatsJob: Job? = null
 
-    fun selectInputSource(src: InputSource) { /*…（RTP/RTSP起動 or 停止）…*/ }
+    // 失敗時の安全リトライ
+    private var gstRetryAttempts = 0
+    private val gstMaxRetries = 10
+    private var gstRetryJob: Job? = null
+
+    fun selectInputSource(src: InputSource) {
+        val mapped = if (src == InputSource.UDP_JPEG) InputSource.GST_RTP_JPEG else src
+        if (_inputSource.value == mapped && gstReceiver != null) return
+
+        stopGStreamer()
+        stopRawUdpIfRunning()
+
+        _inputSource.value = mapped
+        when (mapped) {
+            InputSource.GST_RTP_JPEG  -> startGStreamerRtpSafely()
+            InputSource.GST_RTSP_JPEG -> startGStreamerRtspSafely()
+            InputSource.UDP_JPEG      -> { /* not used */ }
+        }
+    }
+
     fun setRtpPort(port: Int) { _rtpListenPort.value = port }
     fun setRtspUrl(url: String) { _rtspUrl.value = url }
 
-    private fun startGStreamerRtp() {
+    private fun startGStreamerRtpSafely() {
         val port = _rtpListenPort.value
-        gstReceiver = com.example.withcrossdemo.gst.GstReceiver(
-            onJpegFrame = { bytes -> streamRepo.onBytes(bytes) },  // 既存フローに合流
-            onDebug     = { msg -> Timber.d(msg) }
-        ).also { it.startRtpJpegUdp(port) }
+        startGstSafely(
+            startBlock = { it.startRtpJpegUdp(port) },
+            label = "RTP/JPEG port=$port"
+        )
     }
 
-    private fun startGStreamerRtsp() {
+    private fun startGStreamerRtspSafely() {
         val url = _rtspUrl.value
-        gstReceiver = com.example.withcrossdemo.gst.GstReceiver(
-            onJpegFrame = { bytes -> streamRepo.onBytes(bytes) },
-            onDebug     = { msg -> Timber.d(msg) }
-        ).also { it.startRtspJpegUdp(url) }
+        startGstSafely(
+            startBlock = { it.startRtspJpegUdp(url) },
+            label = "RTSP/JPEG url=$url"
+        )
     }
 
+    private fun startGstSafely(startBlock: (GstReceiver) -> Unit, label: String) {
+        try {
+            gstStatsJob?.cancel(); gstStatsJob = null
 
-    private fun stopGStreamer() { /* 停止処理 */ }
+            gstReceiver = GstReceiver(
+                onJpegFrame = { bytes -> streamRepo.onBytes(bytes) },
+                onDebug     = { msg -> Timber.d(msg) }
+            ).also { gst ->
+                gstStatsJob = viewModelScope.launch {
+                    gst.stats.collect { st -> _gstStats.value = st }
+                }
+                startBlock(gst)
+                Timber.d("GStreamer started: $label")
+            }
 
+            gstRetryAttempts = 0
+            gstRetryJob?.cancel(); gstRetryJob = null
+        } catch (e: UnsatisfiedLinkError) {
+            Timber.e(e, "GStreamer native not ready. Will retry...")
+            scheduleGstRetry()
+        } catch (t: Throwable) {
+            Timber.e(t, "GStreamer start failed (non-native error)")
+            scheduleGstRetry()
+        }
+    }
+
+    private fun scheduleGstRetry() {
+        if (gstRetryAttempts >= gstMaxRetries) {
+            Timber.e("GStreamer start retry exceeded (attempts=$gstRetryAttempts). Giving up.")
+            return
+        }
+        val mapped = _inputSource.value
+        gstRetryAttempts++
+        gstRetryJob?.cancel()
+        gstRetryJob = viewModelScope.launch {
+            delay(1200)
+            when (mapped) {
+                InputSource.GST_RTP_JPEG  -> startGStreamerRtpSafely()
+                InputSource.GST_RTSP_JPEG -> startGStreamerRtspSafely()
+                else -> { /* no-op */ }
+            }
+        }
+    }
+
+    private fun stopGStreamer() {
+        try {
+            gstReceiver?.stop()
+        } catch (t: Throwable) {
+            Timber.w(t, "GStreamer stop() failed (ignored)")
+        } finally {
+            gstReceiver = null
+            gstStatsJob?.cancel(); gstStatsJob = null
+            gstRetryJob?.cancel(); gstRetryJob = null
+            gstRetryAttempts = 0
+            _gstStats.value = null
+        }
+    }
+
+    private fun stopRawUdpIfRunning() {
+        try { udpReasm.reset() } catch (_: Throwable) { }
+    }
 
     /* ---------------- 初期化 ---------------- */
     init {
         viewModelScope.launch {
             val port = settingRepo.settingFlow.first { it.port.isNotBlank() }.port
-            ws.start(port.toInt())  // WS(制御/モード) + UDP(ストリーム) を起動【既存】
+            ws.stop()
+            ws.start(port.toInt())  // WS(制御/モード) + UDP(ストリーム)
 
-            // ▼ 追加: UDP 映像ストリーム
             ws.setOnUdpPacketListener { bytes ->
                 if (_inputSource.value == InputSource.UDP_JPEG) {
                     udpReasm.feed(bytes)
                 }
             }
-
-            // （フォールバック）WS /stream を受ける場合も引き続き対応
             ws.setOnStreamBinaryListener { frame ->
-                viewModelScope.launch {
-                    streamRepo.onBinary(frame)
-                }
+                viewModelScope.launch { streamRepo.onBinary(frame) }
             }
-
-            // 既存: /mode コマンド監視
             launch {
                 ws.modeEvents.collect { cmd -> handleModeCommand(cmd) }
             }
+
+            // 既定ソース（GStreamer/RTP）で開始（ネイティブ未準備でも安全にリトライ）
+            selectInputSource(_inputSource.value)
         }
     }
+
     private fun stopVoicePlayback() {
-        try {
-            player?.stop()
-        } catch (_: Exception) { /* stop前に未準備でも安全に無視 */ }
+        try { player?.stop() } catch (_: Exception) { }
         player?.reset()
         player?.release()
         player = null
     }
 
-    // 追加：モード切替の開始遅延ジョブ
     private var startDelayJob: Job? = null
 
-    // 追加：信号音ループだけを起動する関数（必要な時だけ呼ぶ）
     private fun startSignalVoiceLoop() {
         signalVoiceJob?.cancel()
         signalVoiceJob = viewModelScope.launch(Dispatchers.Main) {
@@ -168,7 +238,6 @@ class AppViewModel @Inject constructor(
         }
     }
 
-
     private fun handleModeCommand(cmd: Int) {
         val newMode = when (cmd) {
             0x1001 -> RunMode.SIGNAL
@@ -179,7 +248,7 @@ class AppViewModel @Inject constructor(
         }
         if (newMode != _mode.value) switchMode(newMode)
 
-        when (cmd) {                // ★MP3 再生
+        when (cmd) {
             0x0001 -> play(R.raw.signal_mode)
             0x0010 -> play(R.raw.straight_mode)
             0x0011 -> play(R.raw.object_mode)
@@ -193,136 +262,127 @@ class AppViewModel @Inject constructor(
         }
     }
 
-        /* ---------------- モード遷移 ---------------- */
-        private fun switchMode(newMode: RunMode) {
-            if (_mode.value == newMode) return
+    /* ---------------- モード遷移 ---------------- */
+    private fun switchMode(newMode: RunMode) {
+        if (_mode.value == newMode) return
 
-            val prev = _mode.value                      // ★元のモードを保持
-            // 前モード終了処理
-            runner?.stop(); runner = null
-            signalVoiceJob?.cancel(); signalVoiceJob = null
-            lastStates.clear()
-            startDelayJob?.cancel(); startDelayJob = null
+        val prev = _mode.value
+        runner?.stop(); runner = null
+        signalVoiceJob?.cancel(); signalVoiceJob = null
+        lastStates.clear()
+        startDelayJob?.cancel(); startDelayJob = null
 
-            _mode.value = newMode
+        _mode.value = newMode
 
-            // ★HOME へ戻るときは音声を即停止し、必要ならモータ停止コマンド送信
-            if (newMode == RunMode.HOME) {
-                stopVoicePlayback()                     // ★red/green/none を即停止
-                if (prev == RunMode.SIGNAL || prev == RunMode.STRAIGHT || prev == RunMode.OBJECT) {
-                    viewModelScope.launch {
-                        ws.sendControl(0x0000.toShort())   // ★モータ停止
-                    }
-                }
-                return                                   // HOME はAI起動なし
+        if (newMode == RunMode.HOME) {
+            stopVoicePlayback()
+            if (prev == RunMode.SIGNAL || prev == RunMode.STRAIGHT || prev == RunMode.OBJECT) {
+                viewModelScope.launch { ws.sendControl(0x0000.toShort()) }
             }
-
-            // 1秒の“音声専念”後にAI起動（既存の挙動を維持）
-            startDelayJob = viewModelScope.launch {
-                delay(1500)
-                runner = when (newMode) {
-                    RunMode.SIGNAL   -> createSignalRunner().also { it.start(); startSignalVoiceLoop() }
-                    RunMode.STRAIGHT -> createStraightRunner().also { it.start() }
-                    RunMode.OBJECT   -> createObjectRunner().also { it.start() }
-                    else -> null
-                }
-            }
+            return
         }
 
+        startDelayJob = viewModelScope.launch {
+            delay(1500)
+            runner = when (newMode) {
+                RunMode.SIGNAL   -> createSignalRunner().also { it.start(); startSignalVoiceLoop() }
+                RunMode.STRAIGHT -> createStraightRunner().also { it.start() }
+                RunMode.OBJECT   -> createObjectRunner().also { it.start() }
+                else -> null
+            }
+        }
+    }
 
     /* ---------- SIGNAL ---------- */
-        // 修正：createSignalRunner から音声ループ起動を分離
-        private fun createSignalRunner(): InferenceRunner<SignalState> {
-            val cfg = ModelConfig(
-                "models/convnext_nano.in12k_ft_in1k_best_float32.tflite",
-                288, 288, TaskType.CLASSIFICATION
-            )
-            val proc = SignalClassificationProcessor(cfg, ws) { st ->
-                viewModelScope.launch {
-                    mutex.withLock {
-                        if (lastStates.size == 3) lastStates.removeFirst()
-                        lastStates.addLast(st)
-                    }
+    private fun createSignalRunner(): InferenceRunner<SignalState> {
+        val cfg = ModelConfig(
+            "models/convnext_nano.in12k_ft_in1k_best_float32.tflite",
+            288, 288, TaskType.CLASSIFICATION
+        )
+        val proc = SignalClassificationProcessor(cfg, ws) { st ->
+            viewModelScope.launch {
+                mutex.withLock {
+                    if (lastStates.size == 3) lastStates.removeFirst()
+                    lastStates.addLast(st)
                 }
             }
-            return InferenceRunner(viewModelScope, jpegFlow, cfg, proc, modelManager)
         }
-
+        return InferenceRunner(viewModelScope, jpegFlow, cfg, proc, modelManager)
+    }
 
     /* ---------- STRAIGHT ---------- */
-        private fun createStraightRunner(): InferenceRunner<Float> {
-            val cfg = ModelConfig(
-                "models/convnext_tiny.in12k_ft_in1k_float32.tflite",
-                224, 224, TaskType.REGRESSION
-            )
-            val proc = StraightRegressionProcessor(cfg, ws)
-            return InferenceRunner(viewModelScope, jpegFlow, cfg, proc, modelManager)
-        }
+    private fun createStraightRunner(): InferenceRunner<Float> {
+        val cfg = ModelConfig(
+            "models/convnext_tiny.in12k_ft_in1k_float32.tflite",
+            224, 224, TaskType.REGRESSION
+        )
+        val proc = StraightRegressionProcessor(cfg, ws)
+        return InferenceRunner(viewModelScope, jpegFlow, cfg, proc, modelManager)
+    }
 
-        /* ---------- OBJECT ---------- */
-        private fun createObjectRunner(): InferenceRunner<List<Detection>> {
-            val cfg = ModelConfig("models/yolov8n_float32.tflite", 320, 320, TaskType.DETECTION)
-            val proc = YoloDetectionProcessor(cfg, ws) { dets ->
-                _detectedLabels.value = dets.joinToString(", ")
-            }
-            return InferenceRunner(viewModelScope, jpegFlow, cfg, proc, modelManager)
+    /* ---------- OBJECT ---------- */
+    private fun createObjectRunner(): InferenceRunner<List<Detection>> {
+        val cfg = ModelConfig("models/yolov8n_float32.tflite", 320, 320, TaskType.DETECTION)
+        val proc = YoloDetectionProcessor(cfg, ws) { dets ->
+            _detectedLabels.value = dets.joinToString(", ")
         }
+        return InferenceRunner(viewModelScope, jpegFlow, cfg, proc, modelManager)
+    }
 
-        /* ---------------- MediaPlayer helper ---------------- */
-        private fun play(resId: Int) {
-            try {
-                player?.stop(); player?.reset(); player?.release()
-                player = MediaPlayer().apply {
-                    setOnCompletionListener { mp -> mp.reset(); mp.release(); player = null }
-                    app.resources.openRawResourceFd(resId)!!.use { fd ->
-                        setDataSource(fd.fileDescriptor, fd.startOffset, fd.length)
-                    }
-                    prepare(); start()
+    /* ---------------- MediaPlayer helper ---------------- */
+    private fun play(resId: Int) {
+        try {
+            player?.stop(); player?.reset(); player?.release()
+            player = MediaPlayer().apply {
+                setOnCompletionListener { mp -> mp.reset(); mp.release(); player = null }
+                app.resources.openRawResourceFd(resId)!!.use { fd ->
+                    setDataSource(fd.fileDescriptor, fd.startOffset, fd.length)
                 }
-            } catch (e: Exception) { Timber.e(e, "mp3 再生失敗") }
-        }
-
-        /* ---------------- ViewModel 破棄 ---------------- */
-        override fun onCleared() {
-            super.onCleared()
-            ws.stop()
-            runner?.stop()
-            signalVoiceJob?.cancel()
-            player?.release()
-            stopSaving()
-            stopGStreamer()
-        }
-
-        fun setSaveImagesEnabled(enabled: Boolean) {
-            if (_saveImages.value == enabled) return
-            _saveImages.value = enabled
-            if (enabled) startSaving() else stopSaving()
-        }
-
-        private fun startSaving() {
-            stopSaving() // 二重起動防止
-            saveJob = viewModelScope.launch(Dispatchers.IO) {
-                val base = app.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
-                val dir = File(base, "stream").apply { mkdirs() }
-                val sdf = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US)
-
-                // 1秒に1枚、最新フレームのみ保存
-                streamRepo.jpegFlow
-                    .sample(1000)
-                    .collect { bytes ->
-                        try {
-                            val name = "${sdf.format(Date())}.jpg"
-                            File(dir, name).outputStream().use { it.write(bytes) }
-                            Timber.d("Saved JPEG: %s (%dB)", name, bytes.size)
-                        } catch (e: Exception) {
-                            Timber.e(e, "Save failed")
-                        }
-                    }
+                prepare(); start()
             }
-        }
+        } catch (e: Exception) { Timber.e(e, "mp3 再生失敗") }
+    }
 
-        private fun stopSaving() {
-            saveJob?.cancel()
-            saveJob = null
+    /* ---------------- ViewModel 破棄 ---------------- */
+    override fun onCleared() {
+        super.onCleared()
+        ws.stop()
+        runner?.stop()
+        signalVoiceJob?.cancel()
+        player?.release()
+        stopSaving()
+        stopGStreamer()
+    }
+
+    fun setSaveImagesEnabled(enabled: Boolean) {
+        if (_saveImages.value == enabled) return
+        _saveImages.value = enabled
+        if (enabled) startSaving() else stopSaving()
+    }
+
+    private fun startSaving() {
+        stopSaving()
+        saveJob = viewModelScope.launch(Dispatchers.IO) {
+            val base = app.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+            val dir = File(base, "stream").apply { mkdirs() }
+            val sdf = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US)
+
+            streamRepo.jpegFlow
+                .sample(1000)
+                .collect { bytes ->
+                    try {
+                        val name = "${sdf.format(Date())}.jpg"
+                        File(dir, name).outputStream().use { it.write(bytes) }
+                        Timber.d("Saved JPEG: %s (%dB)", name, bytes.size)
+                    } catch (e: Exception) {
+                        Timber.e(e, "Save failed")
+                    }
+                }
         }
+    }
+
+    private fun stopSaving() {
+        saveJob?.cancel()
+        saveJob = null
+    }
 }

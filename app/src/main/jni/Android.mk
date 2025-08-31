@@ -1,34 +1,53 @@
+# app/src/main/jni/Android.mk
 LOCAL_PATH := $(call my-dir)
 
-# ---- あなたの "空" ネイティブライブラリ（梱包のため） ----
-include $(CLEAR_VARS)
-LOCAL_MODULE    := gstbridge                # 任意名
-LOCAL_SRC_FILES := gstbridge.c              # 中身は空でOK
-LOCAL_LDLIBS    := -llog -landroid
-LOCAL_SHARED_LIBRARIES := gstreamer_android
-include $(BUILD_SHARED_LIBRARY)
-
-# ---- GStreamer の設定（必須）----
-ifndef GSTREAMER_ROOT
+# ===== GStreamer root (SDK 1.26.x の展開場所を Gradle から渡す) =====
 ifndef GSTREAMER_ROOT_ANDROID
 $(error GSTREAMER_ROOT_ANDROID is not defined!)
 endif
-GSTREAMER_ROOT := $(GSTREAMER_ROOT_ANDROID)
+
+# ABI → GStreamer 配布フォルダ名
+ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
+  GSTREAMER_ROOT := $(GSTREAMER_ROOT_ANDROID)/armv7
+else ifeq ($(TARGET_ARCH_ABI),arm64-v8a)
+  GSTREAMER_ROOT := $(GSTREAMER_ROOT_ANDROID)/arm64
+else ifeq ($(TARGET_ARCH_ABI),x86)
+  GSTREAMER_ROOT := $(GSTREAMER_ROOT_ANDROID)/x86
+else ifeq ($(TARGET_ARCH_ABI),x86_64)
+  GSTREAMER_ROOT := $(GSTREAMER_ROOT_ANDROID)/x86_64
+else
+  $(error Unsupported ABI $(TARGET_ARCH_ABI))
 endif
 
-GSTREAMER_NDK_BUILD_PATH := $(GSTREAMER_ROOT)/share/gst-android/ndk-build/
+GSTREAMER_NDK_BUILD_PATH := $(GSTREAMER_ROOT)/share/gst-android/ndk-build
 
-# 必要プラグインをカテゴリで一括指定
-#  - NET: udp/rtp/rtpmanager/rtsp など
-#  - CODECS: jpeg/jpegformat/androidmedia など
-include $(GSTREAMER_NDK_BUILD_PATH)/plugins.mk
-GSTREAMER_PLUGINS := $(GSTREAMER_PLUGINS_CORE) \
-                     $(GSTREAMER_PLUGINS_NET) \
-                     $(GSTREAMER_PLUGINS_CODECS)
+# ★ AGP が探しに行く標準の出力先（app/gst-android-build）に作らせる
+GSTREAMER_OUTPUT_DIR := $(LOCAL_PATH)/../../../gst-android-build
 
-# 他に必要なら gstreamer-video などの追加ライブラリを指定
-GSTREAMER_EXTRA_DEPS := gstreamer-app-1.0 gstreamer-video-1.0
+# 必要プラグイン（ライブラリ名）
+GSTREAMER_PLUGINS := \
+    coreelements app udp rtp rtpmanager rtsp \
+    jpeg jpegformat videoconvertscale
 
-# 最後に gstreamer のmkを読み込み
-include $(GSTREAMER_NDK_BUILD_PATH)/gstreamer.mk
+# 追加のヘッダ/ライブラリ
+GSTREAMER_EXTRA_DEPS := \
+    gstreamer-video-1.0 gstreamer-app-1.0 gstreamer-rtp-1.0 gstreamer-rtsp-1.0 gstreamer-pbutils-1.0
 
+# gstreamer_android のアグリゲータを生成
+include $(GSTREAMER_NDK_BUILD_PATH)/gstreamer-1.0.mk
+
+# ===== JNI ブリッジ（あなたのライブラリ）=====
+include $(CLEAR_VARS)
+LOCAL_MODULE           := gstbridge
+LOCAL_SRC_FILES        := gstbridge.cpp
+LOCAL_CPPFLAGS         += -std=c++17 -fexceptions -frtti
+LOCAL_LDLIBS           := -llog -landroid
+
+# gstreamer_android にリンク
+LOCAL_SHARED_LIBRARIES += gstreamer_android
+
+# GStreamer が用意する CFLAGS / LDFLAGS を取り込む
+LOCAL_CFLAGS  += $(GSTREAMER_CFLAGS)
+LOCAL_LDFLAGS += $(GSTREAMER_LDFLAGS)
+
+include $(BUILD_SHARED_LIBRARY)
