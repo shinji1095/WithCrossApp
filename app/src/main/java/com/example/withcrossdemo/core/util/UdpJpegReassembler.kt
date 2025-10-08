@@ -15,60 +15,78 @@ class UdpJpegReassembler(
     private val maxFrameBytes: Int = 1_500_000
 ) {
     private var buf = ByteArrayOutputStream(256 * 1024)
+    /** 現在フレームを組み立て中かどうか */
+    private var assembling: Boolean = false
 
-    fun reset() { buf.reset() }
+    /** バッファ/状態を初期化 */
+    fun reset() {
+        assembling = false
+        buf.reset()
+    }
 
     fun feed(packet: ByteArray) {
-        if (packet.isEmpty()) return
-        buf.write(packet)
+        var b = packet
 
-        // ストリームとして先頭SOI〜EOIを順に抜き出す
-        while (true) {
-            val all = buf.toByteArray()
-
-            // 1) SOI の位置までスキップ
-            val soi = indexOfSOI(all)
+        if (!assembling) {
+            val soi = indexOfSOI(b)
             if (soi == -1) {
-                // 先頭にゴミが溜まりすぎないようガード
-                if (all.size > maxFrameBytes) { Timber.w("UDP reasm: purge overflow"); reset() }
+                // まだ開始マーカーがない → 次のパケットを待つ
                 return
             }
-            if (soi > 0) {
-                val trailing = all.copyOfRange(soi, all.size)
-                buf.reset(); buf.write(trailing)
+            assembling = true
+            buf.reset()
+            if (soi > 0) b = b.copyOfRange(soi, b.size)
+            Timber.i("REASM: start frame at SOI (offset=%d)", soi)
+        } else {
+            // 既に組み立て中に新しい SOI が来たら前フレームを破棄して再スタート
+            val soi = indexOfSOI(b)
+            if (soi != -1) {
+                Timber.w("REASM: restart on new SOI (previous frame dropped)")
+                buf.reset()
+                assembling = true
+                b = b.copyOfRange(soi, b.size)
+                Timber.i("REASM: start frame at SOI (offset=%d)", soi)
             }
+        }
 
-            // 2) EOI を探す（SOI以降）
-            val a2  = buf.toByteArray()
-            val eoi = indexOfEOI(a2)
-            if (eoi == -1) {
-                if (a2.size > maxFrameBytes) { Timber.w("UDP reasm: frame too large (%d) → reset", a2.size); reset() }
-                return
-            }
+        buf.write(b)
 
-            // 3) 1枚確定
-            val frame = a2.copyOfRange(0, eoi + 2)
+        // 安全のため最大サイズを超えたら捨てる
+        if (buf.size() > maxFrameBytes) {
+            Timber.w("REASM: frame too large (%d) → reset", buf.size())
+            reset()
+            return
+        }
+
+        val all = buf.toByteArray()
+        val eoi = indexOfEOI(all)
+        if (eoi != -1) {
+            // 1 フレーム確定
+            val frame = all.copyOfRange(0, eoi + 2)
+            Timber.i("REASM: complete frame len=%d", frame.size)
             onFrame(frame)
 
-            // 4) 余りがあれば次ループで続けて処理
-            val rest = a2.size - (eoi + 2)
-            buf.reset()
-            if (rest > 0) {
-                buf.write(a2, eoi + 2, rest)
-                continue
+            // 余剰データ（次フレームの先頭など）があれば再帰的に処理
+            val trailingLen = all.size - (eoi + 2)
+            reset()
+            if (trailingLen > 0) {
+                val trailing = all.copyOfRange(eoi + 2, all.size)
+                feed(trailing)
             }
-            return
         }
     }
 
     private fun indexOfSOI(a: ByteArray): Int {
-        for (i in 0 until a.size - 1)
+        for (i in 0 until a.size - 1) {
             if (a[i] == 0xFF.toByte() && a[i + 1] == 0xD8.toByte()) return i
+        }
         return -1
     }
+
     private fun indexOfEOI(a: ByteArray): Int {
-        for (i in 0 until a.size - 1)
+        for (i in 0 until a.size - 1) {
             if (a[i] == 0xFF.toByte() && a[i + 1] == 0xD9.toByte()) return i
+        }
         return -1
     }
 }

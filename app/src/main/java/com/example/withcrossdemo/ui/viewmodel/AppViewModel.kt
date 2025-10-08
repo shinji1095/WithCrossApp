@@ -1,6 +1,8 @@
 package com.example.withcrossdemo.ui.viewmodel
 
+import java.util.concurrent.atomic.AtomicLong
 import android.app.Application
+import android.graphics.Bitmap
 import android.media.MediaPlayer
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -24,7 +26,9 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.Date
 import android.os.Environment
+import com.example.withcrossdemo.core.util.UiLogBridge
 import com.example.withcrossdemo.gst.GstReceiver
+import kotlinx.coroutines.channels.BufferOverflow
 
 enum class RunMode { HOME, SIGNAL, STRAIGHT, OBJECT }
 enum class InputSource { UDP_JPEG, GST_RTP_JPEG, GST_RTSP_JPEG }
@@ -36,6 +40,7 @@ class AppViewModel @Inject constructor(
     private val modelManager: TfliteModelManager,
     settingRepo: SettingRepository
 ) : AndroidViewModel(app) {
+
     /* ---------------- Stream (JPEG) ---------------- */
     private val streamRepo = StreamRepository()
     val jpegFlow = streamRepo.jpegFlow
@@ -52,14 +57,14 @@ class AppViewModel @Inject constructor(
     private var runner: InferenceRunner<*>? = null
 
     /* ---------------- 1.5 秒ごとの信号音声 ---------------- */
-    private val lastStates = ArrayDeque<SignalState>()   // 最新 3 フレーム
+    private val lastStates = ArrayDeque<SignalState>()
     private val mutex = Mutex()
-    private var signalVoiceJob: Job? = null   // ← 重複定義を一本化
+    private var signalVoiceJob: Job? = null
 
     /* ---------------- MediaPlayer ---------------- */
     private var player: MediaPlayer? = null
 
-    /* ----------------（旧）生UDP MJPEGリアセンブラ（※使わないが残す） ---------------- */
+    /* ---------------- 生UDP MJPEGリアセンブラ（保守用） ---------------- */
     private val udpReasm = UdpJpegReassembler(
         onFrame = { frame -> streamRepo.onBytes(frame) },
         maxFrameBytes = 1_500_000
@@ -91,18 +96,100 @@ class AppViewModel @Inject constructor(
     private val gstMaxRetries = 10
     private var gstRetryJob: Job? = null
 
+    // メトリクス
+    private val cUdpPkts = AtomicLong(0)
+    private val cUdpBytes = AtomicLong(0)
+    private val cUdpFedToReasm = AtomicLong(0)
+    private val cUdpIgnored = AtomicLong(0)
+    private val cGstFrames = AtomicLong(0)
+    private val cRepoAccepted = AtomicLong(0)
+    private val cRepoRejected = AtomicLong(0)
+    private val cUiDecoded = AtomicLong(0)
+    private val cAiProcessed = AtomicLong(0)
+
+    private var pipeMetricsJob: Job? = null
+
+    private var signalLogTree: UiLogBridge? = null
+    private val _signalDebugLines = MutableStateFlow<List<String>>(emptyList())
+    val signalDebugLines: StateFlow<List<String>> = _signalDebugLines
+
+    fun enableSignalDebugLogging() {
+        if (signalLogTree != null) return
+        val tree = UiLogBridge(prefix = "SIGNAL") { line ->
+            // 最新20件だけ保持（任意）
+            _signalDebugLines.update { prev ->
+                (prev + line).takeLast(20)
+            }
+        }
+        Timber.plant(tree)
+        signalLogTree = tree
+    }
+
+    fun disableSignalDebugLogging() {
+        signalLogTree?.let { tree ->
+            try { Timber.uproot(tree) } catch (_: Throwable) {}
+        }
+        signalLogTree = null
+        // 必要ならクリア
+        // _signalDebugLines.value = emptyList()
+    }
+
+    private fun pipeLog(msg: String) {
+        Timber.i(msg)
+        _debugLogs.tryEmit(msg)
+    }
+
+    private val _debugLogs = MutableSharedFlow<String>(
+        replay = 0,
+        extraBufferCapacity = 256,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val debugLogs: SharedFlow<String> = _debugLogs.asSharedFlow()
+
+    private fun log(msg: String) {
+        Timber.d(msg)
+        _debugLogs.tryEmit(msg)
+    }
+
+    // RGBA 生バッファを UI へ
+    data class RgbaFrame(val bytes: ByteArray, val width: Int, val height: Int)
+    private val _rgbaFlow = MutableSharedFlow<RgbaFrame>(
+        replay = 0,
+        extraBufferCapacity = 8,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val rgbaFlow: SharedFlow<RgbaFrame> = _rgbaFlow.asSharedFlow()
+
+    // appsink を RGBA にするか
+    private val _appsinkRawRgba = MutableStateFlow(false)
+    val appsinkRawRgba: StateFlow<Boolean> = _appsinkRawRgba.asStateFlow()
+
+    fun setAppsinkRawRgba(enable: Boolean) {
+        if (_appsinkRawRgba.value == enable) return
+        _appsinkRawRgba.value = enable
+
+        // 安全に再起動：停止→少し待ってから開始（前パイプラインの終了を待つ）
+        stopGStreamer()
+        viewModelScope.launch {
+            kotlinx.coroutines.delay(200) // 200ms 程度で十分 / 競合回避
+            if (_inputSource.value == InputSource.GST_RTP_JPEG) {
+                startGStreamerRtpSafely()
+            }
+        }
+    }
+
     fun selectInputSource(src: InputSource) {
-        val mapped = if (src == InputSource.UDP_JPEG) InputSource.GST_RTP_JPEG else src
-        if (_inputSource.value == mapped && gstReceiver != null) return
+        pipeLog("PIPE: selectInputSource=$src")
+        if (_inputSource.value == src && gstReceiver != null) return
 
         stopGStreamer()
         stopRawUdpIfRunning()
 
-        _inputSource.value = mapped
-        when (mapped) {
+        _inputSource.value = src
+        when (src) {
             InputSource.GST_RTP_JPEG  -> startGStreamerRtpSafely()
-            InputSource.GST_RTSP_JPEG -> startGStreamerRtspSafely()
-            InputSource.UDP_JPEG      -> { /* not used */ }
+            InputSource.GST_RTSP_JPEG -> TODO()
+            InputSource.UDP_JPEG      -> { /* 旧経路は非推奨。必要なら復帰可 */ }
         }
     }
 
@@ -112,29 +199,47 @@ class AppViewModel @Inject constructor(
     private fun startGStreamerRtpSafely() {
         val port = _rtpListenPort.value
         startGstSafely(
-            startBlock = { it.startRtpJpegUdp(port) },
-            label = "RTP/JPEG port=$port"
+            startBlock = {
+                it.startRtpJpegUdpEx(
+                    port = port,
+                    rawRgba = _appsinkRawRgba.value,
+                    jitterLatencyMs = 150,
+                    useJitter = true
+                )
+            },
+            label = if (_appsinkRawRgba.value)
+                "RTP/JPEG→RAW(RGBA) port=$port"
+            else "RTP/JPEG port=$port"
         )
     }
 
-    private fun startGStreamerRtspSafely() {
-        val url = _rtspUrl.value
-        startGstSafely(
-            startBlock = { it.startRtspJpegUdp(url) },
-            label = "RTSP/JPEG url=$url"
-        )
-    }
-
-    private fun startGstSafely(startBlock: (GstReceiver) -> Unit, label: String) {
+    private fun startGstSafely(
+        startBlock: (GstReceiver) -> Unit,
+        label: String
+    ) {
         try {
             gstStatsJob?.cancel(); gstStatsJob = null
-
             gstReceiver = GstReceiver(
-                onJpegFrame = { bytes -> streamRepo.onBytes(bytes) },
-                onDebug     = { msg -> Timber.d(msg) }
+                onJpegFrame = { bytes ->
+                    cGstFrames.incrementAndGet()
+                    streamRepo.onBytes(bytes) // ← 修正: repo → streamRepo
+                },
+                onDebug = { msg -> Timber.tag("AppViewModel").d(msg) },
+                onRgbaFrame = { bytes, w, h ->
+                    // UI には RGBA のまま流し、Bitmap化は画面側で
+                    _rgbaFlow.tryEmit(RgbaFrame(bytes, w, h))
+                }
             ).also { gst ->
                 gstStatsJob = viewModelScope.launch {
-                    gst.stats.collect { st -> _gstStats.value = st }
+                    gst.stats.collect { st ->
+                        _gstStats.value = st
+                        st?.let {
+                            Timber.i(
+                                "GST stats: fps=%.1f avg=%.1fms jitter=%.1fms | %s",
+                                it.framesPerSec, it.avgDeltaMs, it.jitterMs, it.pipeline
+                            )
+                        }
+                    }
                 }
                 startBlock(gst)
                 Timber.d("GStreamer started: $label")
@@ -163,16 +268,14 @@ class AppViewModel @Inject constructor(
             delay(1200)
             when (mapped) {
                 InputSource.GST_RTP_JPEG  -> startGStreamerRtpSafely()
-                InputSource.GST_RTSP_JPEG -> startGStreamerRtspSafely()
+                InputSource.GST_RTSP_JPEG -> { /* TODO */ }
                 else -> { /* no-op */ }
             }
         }
     }
 
     private fun stopGStreamer() {
-        try {
-            gstReceiver?.stop()
-        } catch (t: Throwable) {
+        try { gstReceiver?.stop() } catch (t: Throwable) {
             Timber.w(t, "GStreamer stop() failed (ignored)")
         } finally {
             gstReceiver = null
@@ -192,22 +295,45 @@ class AppViewModel @Inject constructor(
         viewModelScope.launch {
             val port = settingRepo.settingFlow.first { it.port.isNotBlank() }.port
             ws.stop()
-            ws.start(port.toInt())  // WS(制御/モード) + UDP(ストリーム)
+            ws.start(port.toInt())
 
             ws.setOnUdpPacketListener { bytes ->
+                cUdpPkts.incrementAndGet()
+                cUdpBytes.addAndGet(bytes.size.toLong())
                 if (_inputSource.value == InputSource.UDP_JPEG) {
+                    cUdpFedToReasm.incrementAndGet()
                     udpReasm.feed(bytes)
+                } else {
+                    if (cUdpIgnored.incrementAndGet() % 60 == 1L) {
+                        Timber.w("PIPE: UDP packet ignored because inputSource=%s", _inputSource.value)
+                    }
                 }
             }
+
             ws.setOnStreamBinaryListener { frame ->
                 viewModelScope.launch { streamRepo.onBinary(frame) }
             }
-            launch {
-                ws.modeEvents.collect { cmd -> handleModeCommand(cmd) }
-            }
 
-            // 既定ソース（GStreamer/RTP）で開始（ネイティブ未準備でも安全にリトライ）
+            launch { ws.modeEvents.collect { cmd -> handleModeCommand(cmd) } }
+
+            // 既定ソース（GStreamer/RTP）
             selectInputSource(_inputSource.value)
+        }
+
+        pipeMetricsJob?.cancel()
+        pipeMetricsJob = viewModelScope.launch(Dispatchers.Default) {
+            while (isActive) {
+                delay(1000)
+                val log = "PIPE-METRICS " +
+                        "udp=${cUdpPkts.getAndSet(0)} pkts/s (${String.format("%.1f", cUdpBytes.getAndSet(0)/1000.0)} KB/s), " +
+                        "udp→reasm=${cUdpFedToReasm.getAndSet(0)} f/s, " +
+                        "udpIgnored=${cUdpIgnored.getAndSet(0)} pkts/s, " +
+                        "gstFrames=${cGstFrames.getAndSet(0)} f/s, " +
+                        "repoOK=${cRepoAccepted.getAndSet(0)} f/s drop=${cRepoRejected.getAndSet(0)} f/s, " +
+                        "ui=${cUiDecoded.getAndSet(0)} f/s, ai=${cAiProcessed.getAndSet(0)} f/s, " +
+                        "src=${_inputSource.value}"
+                pipeLog(log)
+            }
         }
     }
 
@@ -225,8 +351,8 @@ class AppViewModel @Inject constructor(
         signalVoiceJob = viewModelScope.launch(Dispatchers.Main) {
             while (isActive) {
                 val majority = mutex.withLock {
-                    if (lastStates.isEmpty()) SignalState.NONE else
-                        lastStates.groupingBy { it }.eachCount().maxBy { it.value }.key
+                    if (lastStates.isEmpty()) SignalState.NONE
+                    else lastStates.groupingBy { it }.eachCount().maxBy { it.value }.key
                 }
                 when (majority) {
                     SignalState.RED   -> play(R.raw.red)
@@ -255,10 +381,7 @@ class AppViewModel @Inject constructor(
             0x1001 -> play(R.raw.signal_activate)
             0x1010 -> play(R.raw.straight_activate)
             0x1011 -> play(R.raw.object_activate)
-            0x1111 -> {
-                play(R.raw.deactivate)
-                stopVoicePlayback()
-            }
+            0x1111 -> { play(R.raw.deactivate); stopVoicePlayback() }
         }
     }
 
@@ -282,6 +405,16 @@ class AppViewModel @Inject constructor(
             return
         }
 
+        if (prev == RunMode.SIGNAL) {
+            disableSignalDebugLogging()
+        }
+
+        _mode.value = newMode
+
+        if (newMode == RunMode.SIGNAL) {
+            enableSignalDebugLogging()
+        }
+
         startDelayJob = viewModelScope.launch {
             delay(1500)
             runner = when (newMode) {
@@ -296,7 +429,7 @@ class AppViewModel @Inject constructor(
     /* ---------- SIGNAL ---------- */
     private fun createSignalRunner(): InferenceRunner<SignalState> {
         val cfg = ModelConfig(
-            "models/convnext_nano.in12k_ft_in1k_best_float32.tflite",
+            "models/hgnetv2_b3.ssld_stage2_ft_in1k_fp32.tflite",
             288, 288, TaskType.CLASSIFICATION
         )
         val proc = SignalClassificationProcessor(cfg, ws) { st ->
@@ -343,7 +476,6 @@ class AppViewModel @Inject constructor(
         } catch (e: Exception) { Timber.e(e, "mp3 再生失敗") }
     }
 
-    /* ---------------- ViewModel 破棄 ---------------- */
     override fun onCleared() {
         super.onCleared()
         ws.stop()

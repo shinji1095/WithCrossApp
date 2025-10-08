@@ -12,6 +12,7 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
@@ -34,6 +35,28 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import com.example.withcrossdemo.ui.viewmodel.InputSource
+import com.example.withcrossdemo.ui.viewmodel.AppViewModel.RgbaFrame
+
+@Composable
+private fun SignalDebugPanel(viewModel: AppViewModel) {
+    val signalLines by viewModel.signalDebugLines.collectAsState()
+    if (signalLines.isNotEmpty()) {
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = "Signal Debug",
+            style = MaterialTheme.typography.titleSmall
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        // 最新から最大8行程度を見せる
+        val shown = signalLines.takeLast(8)
+        shown.forEach { line ->
+            Text(
+                text = line,
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -44,39 +67,69 @@ fun AppScreen(
     var debugOn by remember { mutableStateOf(false) }
     var csvName by remember { mutableStateOf("log.csv") }
 
-    val mode  by vm.mode.collectAsState()
-    val logs  = remember { mutableStateListOf<String>() }
-    val labels by vm.detectedLabels.collectAsState()
+    val mode = vm.mode.collectAsState().value
+    val labels = vm.detectedLabels.collectAsState().value
 
     val scope = rememberCoroutineScope()
     val jpegFlow = remember { vm.jpegFlow }  // SharedFlow<ByteArray>
     var uiBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
-    // ==== 追加: 保存トグル ====
+    // 保存トグル
     var saveImagesOn by rememberSaveable { mutableStateOf(false) }
     val ctx = LocalContext.current
     val saveDir = remember {
-        File(ctx.getExternalFilesDir(Environment.DIRECTORY_PICTURES), "stream")
-            .also { it.mkdirs() }
+        File(ctx.getExternalFilesDir(Environment.DIRECTORY_PICTURES), "stream").also { it.mkdirs() }
     }
     val saveDirPath = remember { saveDir.absolutePath }
     val sdf = remember { SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US) }
 
-    // ==== デバッグ用Bitmap描画 ====
-    LaunchedEffect(debugOn) {
-        uiBitmap = null
-        if (!debugOn) return@LaunchedEffect
-        jpegFlow
-            .mapLatest { bytes ->
-                withContext(Dispatchers.Default) {
-                    val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.RGB_565 }
-                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
-                }
-            }
-            .collect { bmp -> uiBitmap = bmp }
+    val appsinkRawRgba = vm.appsinkRawRgba.collectAsState().value
+
+    fun rgbaToBitmap(frame: RgbaFrame): Bitmap {
+        val (bytes, w, h) = frame
+        val pixels = IntArray(w * h)
+        var j = 0
+        for (i in 0 until w * h) {
+            val r = bytes[j++].toInt() and 0xFF
+            val g = bytes[j++].toInt() and 0xFF
+            val b = bytes[j++].toInt() and 0xFF
+            val a = bytes[j++].toInt() and 0xFF
+            pixels[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
+        }
+        return Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
     }
 
-    // ==== 1秒間隔の保存 ====
+    // デバッグ表示: JPEG と RGBA を切替
+    LaunchedEffect(debugOn, appsinkRawRgba) {
+        uiBitmap = null
+        if (!debugOn) return@LaunchedEffect
+
+        if (!appsinkRawRgba) {
+            // JPEG
+            jpegFlow
+                .mapLatest { bytes ->
+                    withContext(Dispatchers.Default) {
+                        val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.RGB_565 }
+                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+                    }
+                }
+                .collect { bmp ->
+                    if (bmp == null) Timber.w("UI: decode failed (JPEG)")
+                    else Timber.i("UI: decoded bitmap %dx%d", bmp.width, bmp.height)
+                    uiBitmap = bmp
+                }
+        } else {
+            // RGBA
+            vm.rgbaFlow
+                .mapLatest { frame -> withContext(Dispatchers.Default) { rgbaToBitmap(frame) } }
+                .collect { bmp ->
+                    Timber.i("UI: RGBA bitmap %dx%d", bmp.width, bmp.height)
+                    uiBitmap = bmp
+                }
+        }
+    }
+
+    // 1秒間隔の保存
     LaunchedEffect(saveImagesOn) {
         if (!saveImagesOn) return@LaunchedEffect
         jpegFlow
@@ -94,7 +147,8 @@ fun AppScreen(
             }
     }
 
-    // モード変化ログ
+    // モード変化ログ（簡易）
+    val logs = remember { mutableStateListOf<String>() }
     LaunchedEffect(mode) { logs.add("MODE → ${mode.name}") }
 
     Scaffold(
@@ -116,7 +170,7 @@ fun AppScreen(
             contentPadding = PaddingValues(8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // ---------- トグル & 状態 ----------
+            // トグル群
             item {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("デバッグ出力")
@@ -136,9 +190,7 @@ fun AppScreen(
                     Text("保存先: $saveDirPath", style = MaterialTheme.typography.bodySmall)
                 }
             }
-            item {
-                Text("現在モード: ${mode.name}")
-            }
+            item { Text("現在モード: ${mode.name}") }
 
             item {
                 if (mode == RunMode.OBJECT) {
@@ -161,13 +213,11 @@ fun AppScreen(
                 )
             }
 
-            item {
-                Button(onClick = { Timber.i("TODO: export CSV $csvName") }) { Text("CSV 出力") }
-            }
+            item { Button(onClick = { Timber.i("TODO: export CSV $csvName") }) { Text("CSV 出力") } }
 
             item { Divider() }
 
-            // ---------- デバッグ UI ----------
+            // デバッグUI
             item {
                 if (debugOn) {
                     uiBitmap?.let { bmp ->
@@ -180,10 +230,10 @@ fun AppScreen(
                         )
                     } ?: Text("画像がまだ届いていません…", style = MaterialTheme.typography.bodySmall)
 
-                    val inputSrc by vm.inputSource.collectAsState()
-                    val gstStats by vm.gstStats.collectAsState()
-                    val rtpPort by vm.rtpListenPort.collectAsState()
-                    val rtspUrl by vm.rtspUrl.collectAsState()
+                    val inputSrc = vm.inputSource.collectAsState().value
+                    val gstStats = vm.gstStats.collectAsState().value
+                    val rtpPort = vm.rtpListenPort.collectAsState().value
+                    val rtspUrl = vm.rtspUrl.collectAsState().value
 
                     Spacer(Modifier.height(8.dp))
 
@@ -195,6 +245,28 @@ fun AppScreen(
                         Spacer(Modifier.width(8.dp))
                         AssistChip(onClick = { vm.selectInputSource(InputSource.GST_RTSP_JPEG) }, label = { Text("GST RTSP/JPEG") })
                     }
+
+                    // appsink 出力選択
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Appsink 出力:", modifier = Modifier.padding(end = 8.dp))
+                        AssistChip(
+                            onClick = { vm.setAppsinkRawRgba(false) },
+                            label = { Text("JPEG") },
+                            leadingIcon = { if (!appsinkRawRgba) Text("●") }
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        AssistChip(
+                            onClick = { vm.setAppsinkRawRgba(true) },
+                            label = { Text("RGBA") },
+                            leadingIcon = { if (appsinkRawRgba) Text("●") }
+                        )
+                    }
+                    Text(
+                        if (appsinkRawRgba) "appsink: video/x-raw,format=RGBA"
+                        else "appsink: image/jpeg",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+
                     Text("選択中: $inputSrc", style = MaterialTheme.typography.bodySmall)
 
                     if (inputSrc == InputSource.GST_RTP_JPEG) {
@@ -229,15 +301,15 @@ fun AppScreen(
                         Text("Pipeline: ${st.pipeline}", style = MaterialTheme.typography.bodySmall)
                     }
 
+                    SignalDebugPanel(vm)
+
                     Divider()
                 }
             }
 
-            // ---------- ログ ----------
+            // ログ（簡易）
             item { Text("ログ", style = MaterialTheme.typography.titleSmall) }
-            items(logs) { line ->
-                Text(line, style = MaterialTheme.typography.bodySmall)
-            }
+            items(logs) { line -> Text(line, style = MaterialTheme.typography.bodySmall) }
 
             if (BuildConfig.DEBUG) {
                 item { Text("MODE = $mode", Modifier.padding(4.dp)) }

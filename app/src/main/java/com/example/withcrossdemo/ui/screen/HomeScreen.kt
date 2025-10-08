@@ -8,6 +8,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.navigation.NavHostController
 import com.example.withcrossdemo.ui.nav.Screen
 
@@ -17,7 +18,7 @@ fun HomeScreen(navController: NavHostController) {
     Scaffold(
         topBar = {
             SmallTopAppBar(
-                title = { Text("WithCrossDemo") },
+                title = { Text("デモアプリケーション") },
                 navigationIcon = {
                     IconButton(
                         onClick = { navController.navigate(Screen.DeviceSetting.route) }
@@ -33,9 +34,17 @@ fun HomeScreen(navController: NavHostController) {
             contentAlignment = Alignment.Center
         ) {
             Button(
-                modifier = Modifier.padding(16.dp),
+                modifier = Modifier
+                    .padding(16.dp)
+                    .height(120.dp)
+                    .width(400.dp),
                 onClick = { navController.navigate(Screen.BleSetup.route) }
-            ) { Text("スタート") }
+            ) {
+                Text(
+                    text = "スタート",
+                    fontSize = 20.sp
+                )
+            }
         }
     }
 }

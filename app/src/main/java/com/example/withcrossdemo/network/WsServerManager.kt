@@ -44,13 +44,16 @@ class WsServerManager {
         streamListener = l
     }
 
+    // ★ 追加: UDP 受信統計
+    private var udpPkts = 0L
+    private var udpBytes = 0L
+    private var udpLastLog = 0L
 
     fun start(port: Int) {
         if (engine != null && currentPort == port) return
-
         stop() // 別ポートで動いていたら終了
 
-        Timber.i("WS-Srv: start on $port")
+        Timber.i("WS-Srv: start on %d", port)
 
         engine = embeddedServer(
             CIO,
@@ -73,20 +76,20 @@ class WsServerManager {
                         Timber.w(e)
                     }
                 }
-                webSocket("/control") {               // ★既存
+                webSocket("/control") {
                     Timber.i("/control connected")
-                    controlSessions += this           // ★追加
+                    controlSessions += this
                     try { for (frame in incoming) { } } finally { controlSessions -= this }
                 }
                 webSocket("/mode") {
                     Timber.i("/mode connected")
                     for (frame in incoming) {
-                        val bytes = (frame as? Frame.Binary)?.readBytes() ?: continue   // 変更①
-                        if (bytes.size < 2) continue                                    // 変更②
+                        val bytes = (frame as? Frame.Binary)?.readBytes() ?: continue
+                        if (bytes.size < 2) continue
 
                         val cmd = (bytes[0].toInt() and 0xFF shl 8) or
                                 (bytes[1].toInt() and 0xFF)
-                        Timber.i("WS-Cmd recv : 0x%04X", cmd)                           // ★ログ①
+                        Timber.i("WS-Cmd recv : 0x%04X", cmd)
                         _modeEvents.tryEmit(cmd)
                     }
                 }
@@ -97,20 +100,38 @@ class WsServerManager {
         currentPort = port
     }
 
-    // ▼ 追加: UDP 受信ループ
     private fun startUdp(port: Int) {
         udpJob?.cancel()
         udpSocket?.close()
+        udpPkts = 0; udpBytes = 0; udpLastLog = System.currentTimeMillis()
+
         udpJob = scope.launch {
             try {
                 DatagramSocket(port).use { s ->
                     udpSocket = s
-                    Timber.i("UDP-Srv: start on $port")
+                    Timber.i("UDP-Srv: start on %d", port)
                     val buf = ByteArray(65507) // 最大安全ペイロード
                     while (isActive) {
                         val p = DatagramPacket(buf, buf.size)
                         s.receive(p)
-                        val bytes = p.data.copyOf(p.length) // 受信サイズぶんを切り出し
+                        val bytes = p.data.copyOf(p.length)
+
+                        // ★ 追加: 統計カウント
+                        udpPkts++
+                        udpBytes += p.length.toLong()
+                        val now = System.currentTimeMillis()
+                        if (now - udpLastLog >= 1000L) {
+                            Timber.i(
+                                "UDP-Srv: %d pkts/s, %.1f KB/s (last %s:%d len=%d)",
+                                udpPkts,
+                                udpBytes / 1000.0,
+                                p.address?.hostAddress ?: "?",
+                                p.port,
+                                p.length
+                            )
+                            udpPkts = 0; udpBytes = 0; udpLastLog = now
+                        }
+
                         udpListener?.invoke(bytes)
                     }
                 }
@@ -126,13 +147,11 @@ class WsServerManager {
         Timber.i("WS-Srv: /control → 0x%04X", code.toInt() and 0xFFFF)
     }
 
-    /** サーバー停止 */
     fun stop() {
         engine?.stop(gracePeriodMillis = 200, timeoutMillis = 1_000)
         engine = null
         currentPort = -1
         controlSessions.clear()
-        // ▼ 追加: UDP 停止処理
         udpJob?.cancel()
         udpSocket?.close()
         udpJob = null

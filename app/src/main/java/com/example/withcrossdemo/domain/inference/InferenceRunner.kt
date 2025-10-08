@@ -71,9 +71,17 @@ class InferenceRunner<T : Any>(
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
         val opts = BitmapFactory.Options().apply {
             inSampleSize = calcInSampleSize(bounds.outWidth, bounds.outHeight, reqW, reqH)
-            inPreferredConfig = Bitmap.Config.ARGB_8888   // ★ここをRGB_565→ARGB_8888に
+            inPreferredConfig = Bitmap.Config.ARGB_8888
         }
-        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+        if (bmp == null) {
+            Timber.w("AI: decodeDownsampledOrNull -> null (src=%dx%d ~ req=%dx%d)",
+                bounds.outWidth, bounds.outHeight, reqW, reqH)                 // ★追加
+        } else {
+            Timber.i("AI: input bitmap %dx%d (req=%dx%d)",
+                bmp.width, bmp.height, reqW, reqH)                              // ★追加
+        }
+        return bmp
     }
 
 
@@ -89,18 +97,25 @@ class InferenceRunner<T : Any>(
                     } ?: throw SkipFrame("decodeByteArray returned null")
                     val raw    = processor.run(tflite, processor.preprocess(bmp))
                     val output = processor.postprocess(raw)
-                    Timber.d("AI raw=%s → out=%s", raw, output)
-                    @Suppress("UNCHECKED_CAST")
+
+                    if (output is Collection<*>) {
+                        Timber.i("AI: output collection size=%d", output.size)              // ★追加
+                    } else {
+                        Timber.i("AI: output=%s", output.toString())                        // ★追加
+                    }
                     output
                 }
                 .catch { e ->
                     if (e is SkipFrame) {
-                        Timber.w("Skip frame: %s", e.message)
+                        Timber.w("AI: Skip frame: %s", e.message)                           // ★追加
                     } else {
-                        Timber.e(e, "推論中に例外")
+                        Timber.e(e, "AI: 推論中に例外")
                     }
                 }
-                .collect { out -> processor.handleResult(out) }
+                .collect { out ->
+                    // ★ AppViewModel 側のカウンタ加算は簡略化。ここではログに徹する。
+                    processor.handleResult(out)
+                }
         }
     }
 
