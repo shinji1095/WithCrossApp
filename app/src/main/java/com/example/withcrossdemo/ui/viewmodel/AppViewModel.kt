@@ -125,6 +125,16 @@ class AppViewModel @Inject constructor(
         signalLogTree = tree
     }
 
+    fun setRepoDumpEnabled(enabled: Boolean) {
+        streamRepo.setDumpEnabled(enabled)
+    }
+    fun setRepoDumpLimit(limit: Int) {
+        streamRepo.setDumpLimit(limit)
+    }
+    fun resetRepoDumpCounter() {
+        streamRepo.resetDumpCounter()
+    }
+
     fun disableSignalDebugLogging() {
         signalLogTree?.let { tree ->
             try { Timber.uproot(tree) } catch (_: Throwable) {}

@@ -30,9 +30,18 @@ class StreamRepository {
         return soi && eoi
     }
 
+    @Volatile private var dumpEnabled: Boolean = true
+    @Volatile private var dumpLimit: Int = 10000
+
+    fun setDumpEnabled(enabled: Boolean) { dumpEnabled = enabled }
+    fun setDumpLimit(limit: Int) { dumpLimit = if (limit < 0) 0 else limit }
+    fun resetDumpCounter() { dumpCount = 0 }
+
     private var dumpCount = 0
     private fun dumpOnce(bytes: ByteArray) {
-        if (dumpCount >= 5) return
+        if (!dumpEnabled) return
+        if (dumpCount >= dumpLimit) return
+
         try {
             val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "WithCross")
             dir.mkdirs()

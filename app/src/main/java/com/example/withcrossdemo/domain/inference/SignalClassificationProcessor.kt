@@ -1,6 +1,7 @@
 package com.example.withcrossdemo.domain.inference
 
 import android.graphics.Bitmap
+import com.example.withcrossdemo.core.util.rgbToBgr
 import com.example.withcrossdemo.core.util.toTensorImage
 import com.example.withcrossdemo.domain.model.SignalState
 import com.example.withcrossdemo.network.WsServerManager
@@ -23,10 +24,10 @@ class SignalClassificationProcessor(
 
     private var lastState: SignalState? = null
 
-    override suspend fun preprocess(input: Bitmap): Any =
-        // 同じユーティリティで TensorImage 化（既存実装に準拠）
-        input.toTensorImage(cfg.inputWidth, cfg.inputHeight) // :contentReference[oaicite:2]{index=2}
-
+    override suspend fun preprocess(input: Bitmap): Any {
+        val ti = input.toTensorImage(cfg.inputWidth, cfg.inputHeight)
+        return rgbToBgr(ti)
+    }
     override suspend fun run(tflite: InterpreterApi, preprocessed: Any): Any {
         val tensorImage = preprocessed as TensorImage
         val outShape = tflite.getOutputTensor(0).shape() // 例: [1,3] or [3]

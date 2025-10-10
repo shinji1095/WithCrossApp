@@ -76,6 +76,15 @@ fun AppScreen(
 
     // 保存トグル
     var saveImagesOn by rememberSaveable { mutableStateOf(false) }
+    var repoDumpEnabled by rememberSaveable { mutableStateOf(true) }
+    var repoDumpLimitText by rememberSaveable { mutableStateOf("5") }
+
+    // 初期同期（画面表示時1度だけ）
+    LaunchedEffect(Unit) {
+        vm.setRepoDumpEnabled(repoDumpEnabled)
+        vm.setRepoDumpLimit(repoDumpLimitText.toIntOrNull() ?: 5)
+    }
+
     val ctx = LocalContext.current
     val saveDir = remember {
         File(ctx.getExternalFilesDir(Environment.DIRECTORY_PICTURES), "stream").also { it.mkdirs() }
@@ -133,7 +142,7 @@ fun AppScreen(
     LaunchedEffect(saveImagesOn) {
         if (!saveImagesOn) return@LaunchedEffect
         jpegFlow
-            .sample(1000)
+            .sample(500)
             .collectLatest { bytes ->
                 try {
                     val name = "${sdf.format(Date())}.jpg"
@@ -146,6 +155,7 @@ fun AppScreen(
                 }
             }
     }
+
 
     // モード変化ログ（簡易）
     val logs = remember { mutableStateListOf<String>() }
@@ -190,6 +200,40 @@ fun AppScreen(
                     Text("保存先: $saveDirPath", style = MaterialTheme.typography.bodySmall)
                 }
             }
+            // AppScreen.kt（既存の「画像保存(1秒おき)」行の直後に追加）
+            item {
+                Column {
+                    Text("StreamRepository の初回ダンプ（Downloads/WithCross）")
+                    Spacer(Modifier.height(4.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("有効化")
+                        Spacer(Modifier.width(8.dp))
+                        Switch(
+                            checked = repoDumpEnabled,
+                            onCheckedChange = {
+                                repoDumpEnabled = it
+                                vm.setRepoDumpEnabled(it)
+                            }
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(
+                            value = repoDumpLimitText,
+                            onValueChange = { repoDumpLimitText = it.filter { ch -> ch.isDigit() } },
+                            label = { Text("ダンプ枚数（0で保存なし）") },
+                            modifier = Modifier.weight(1f)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Button(onClick = {
+                            vm.setRepoDumpLimit(repoDumpLimitText.toIntOrNull() ?: 5)
+                        }) { Text("適用") }
+                        Spacer(Modifier.width(8.dp))
+                        OutlinedButton(onClick = { vm.resetRepoDumpCounter() }) { Text("カウンタリセット") }
+                    }
+                }
+            }
+
             item { Text("現在モード: ${mode.name}") }
 
             item {
