@@ -8,6 +8,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -91,6 +92,7 @@ class InferenceRunner<T : Any>(
             val tflite = modelManager.getInterpreter(modelCfg)
 
             jpegFlow
+                .conflate()
                 .mapLatest { bytes ->
                     val bmp = withContext(Dispatchers.Default) {
                         decodeDownsampledOrNull(bytes, modelCfg.inputWidth, modelCfg.inputHeight)

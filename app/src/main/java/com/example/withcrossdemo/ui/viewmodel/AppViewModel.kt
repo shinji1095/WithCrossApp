@@ -30,8 +30,25 @@ import com.example.withcrossdemo.core.util.UiLogBridge
 import com.example.withcrossdemo.gst.GstReceiver
 import kotlinx.coroutines.channels.BufferOverflow
 
+import android.content.Context
+import android.os.SystemClock
+import androidx.datastore.preferences.core.longPreferencesKey
+import androidx.datastore.preferences.core.emptyPreferences
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.flow.map
+
+
 enum class RunMode { HOME, SIGNAL, STRAIGHT, OBJECT }
 enum class InputSource { UDP_JPEG, GST_RTP_JPEG, GST_RTSP_JPEG }
+
+private val Context.signalPrefs by preferencesDataStore(name = "signal_prefs")
+
+private object SignalPrefsKeys {
+    val ANNOUNCE_MS = longPreferencesKey("announce_ms")
+    val TICK_MS     = longPreferencesKey("tick_ms")
+}
+
 
 @HiltViewModel
 class AppViewModel @Inject constructor(
@@ -40,6 +57,22 @@ class AppViewModel @Inject constructor(
     private val modelManager: TfliteModelManager,
     settingRepo: SettingRepository
 ) : AndroidViewModel(app) {
+
+    // ----- Signal FSM -----
+    private var stableSignal: SignalState = SignalState.NONE
+    private var redCount  = 0
+    private var greenCount = 0
+    private var noneStreak = 0
+
+    // 周期再生ジョブ
+    private var announceJob: Job? = null
+    private var tickJob: Job? = null
+    private var lastAnnounceAtMs: Long = 0L
+
+    // 再生間隔（設定から購読）
+    private val _signalAnnounceIntervalMs = MutableStateFlow(4000L)
+    private val _signalTickIntervalMs     = MutableStateFlow(1000L)
+
 
     /* ---------------- Stream (JPEG) ---------------- */
     private val streamRepo = StreamRepository()
@@ -63,6 +96,8 @@ class AppViewModel @Inject constructor(
 
     /* ---------------- MediaPlayer ---------------- */
     private var player: MediaPlayer? = null
+    // 追加（刻音用）
+    private var tickPlayer: MediaPlayer? = null
 
     /* ---------------- 生UDP MJPEGリアセンブラ（保守用） ---------------- */
     private val udpReasm = UdpJpegReassembler(
@@ -345,14 +380,148 @@ class AppViewModel @Inject constructor(
                 pipeLog(log)
             }
         }
+
+        viewModelScope.launch {
+            app.signalPrefs.data
+                .catch { emit(emptyPreferences()) }
+                .collect { prefs ->
+                    _signalAnnounceIntervalMs.value = prefs[SignalPrefsKeys.ANNOUNCE_MS] ?: 4000L
+                    _signalTickIntervalMs.value     = prefs[SignalPrefsKeys.TICK_MS]     ?: 1000L
+                }
+        }
+
     }
+
+    /** 刻音（プレイヤが再生中ならスキップ＝優先度低） */
+    private fun playTickIfIdle(resId: Int) {
+        if (player?.isPlaying == true) return
+        try {
+            player = MediaPlayer().apply {
+                setOnCompletionListener { mp -> mp.reset(); mp.release(); player = null }
+                app.resources.openRawResourceFd(resId)!!.use { fd ->
+                    setDataSource(fd.fileDescriptor, fd.startOffset, fd.length)
+                }
+                prepare(); start()
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "tick play failed")
+        }
+    }
+
+    private fun cancelSignalSchedulers() {
+        announceJob?.cancel(); announceJob = null
+        tickJob?.cancel(); tickJob = null
+    }
+
+    private fun startSchedulersFor(state: SignalState) {
+        cancelSignalSchedulers()
+        when (state) {
+            SignalState.RED -> {
+                // 4s ごとのアナウンス
+                announceJob = viewModelScope.launch(Dispatchers.Main) {
+                    while (isActive && stableSignal == SignalState.RED) {
+                        delay(_signalAnnounceIntervalMs.value)
+                        if (stableSignal != SignalState.RED) break
+                        playAnnounce(R.raw.red)
+                    }
+                }
+                // 1s ごとの刻音（抑制なし）
+                tickJob = viewModelScope.launch(Dispatchers.Main) {
+                    while (isActive && stableSignal == SignalState.RED) {
+                        delay(_signalTickIntervalMs.value)
+                        if (stableSignal != SignalState.RED) break
+                        playTick(R.raw.red_sound)
+                    }
+                }
+            }
+            SignalState.GREEN -> {
+                announceJob = viewModelScope.launch(Dispatchers.Main) {
+                    while (isActive && stableSignal == SignalState.GREEN) {
+                        delay(_signalAnnounceIntervalMs.value)
+                        if (stableSignal != SignalState.GREEN) break
+                        playAnnounce(R.raw.green)
+                    }
+                }
+                tickJob = viewModelScope.launch(Dispatchers.Main) {
+                    while (isActive && stableSignal == SignalState.GREEN) {
+                        delay(_signalTickIntervalMs.value)
+                        if (stableSignal != SignalState.GREEN) break
+                        playTick(R.raw.green_sound)
+                    }
+                }
+            }
+            else -> { /* NONE は何もしない */ }
+        }
+    }
+
+
+    private fun transitionTo(newState: SignalState) {
+        if (stableSignal == newState) return
+        val prev = stableSignal
+        stableSignal = newState
+        Timber.i("SIGNAL-FSM: %s → %s (redCount=%d, greenCount=%d, noneStreak=%d)",
+            prev, newState, redCount, greenCount, noneStreak)
+
+        cancelSignalSchedulers()
+
+        when (newState) {
+            SignalState.RED -> {
+                // ★ 同時開始：赤アナウンス + 赤刻音
+                playAnnounce(R.raw.red)
+                playTick(R.raw.red_sound)
+                startSchedulersFor(SignalState.RED)
+            }
+            SignalState.GREEN -> {
+                // ★ 同時開始：青アナウンス + 青刻音
+                playAnnounce(R.raw.green)
+                playTick(R.raw.green_sound)
+                startSchedulersFor(SignalState.GREEN)
+            }
+            SignalState.NONE -> {
+                stopVoicePlayback() // none.mp3 は使わない
+            }
+        }
+    }
+
+
 
     private fun stopVoicePlayback() {
         try { player?.stop() } catch (_: Exception) { }
         player?.reset()
         player?.release()
         player = null
+
+        // ★ 追加：刻音側も停止
+        try { tickPlayer?.stop() } catch (_: Exception) { }
+        tickPlayer?.reset()
+        tickPlayer?.release()
+        tickPlayer = null
     }
+
+    /** アナウンス（割り込み可・優先度高） */
+    private fun playAnnounce(resId: Int) {
+        play(resId) // 既存の play() をそのまま使用（player を使う）
+    }
+
+    /** 刻音（tick 用。announce と同時再生可能） */
+    private fun playTick(resId: Int) {
+        try {
+            // 刻音側だけ扱う
+            tickPlayer?.stop()
+            tickPlayer?.reset()
+            tickPlayer?.release()
+            tickPlayer = MediaPlayer().apply {
+                setOnCompletionListener { mp -> mp.reset(); mp.release(); tickPlayer = null }
+                app.resources.openRawResourceFd(resId)!!.use { fd ->
+                    setDataSource(fd.fileDescriptor, fd.startOffset, fd.length)
+                }
+                prepare(); start()
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "tick play failed")
+        }
+    }
+
 
     private var startDelayJob: Job? = null
 
@@ -425,10 +594,25 @@ class AppViewModel @Inject constructor(
             enableSignalDebugLogging()
         }
 
+        // 既存：RunMode 切替ブロック内
+        if (newMode == RunMode.SIGNAL) {
+            enableSignalDebugLogging()
+        }
+
+// ↓ 1.5s 遅延開始の when(newMode) ブロック内
         startDelayJob = viewModelScope.launch {
             delay(1500)
             runner = when (newMode) {
-                RunMode.SIGNAL   -> createSignalRunner().also { it.start(); startSignalVoiceLoop() }
+                RunMode.SIGNAL   -> createSignalRunner().also {
+                    // it.start() は既存のまま
+                    it.start()
+                    // ★ ここで旧ループは起動しない（none.mp3 を使わないため）
+                    // startSignalVoiceLoop() は削除
+                    // FSM を初期化
+                    stableSignal = SignalState.NONE
+                    redCount = 0; greenCount = 0; noneStreak = 0
+                    cancelSignalSchedulers()
+                }
                 RunMode.STRAIGHT -> createStraightRunner().also { it.start() }
                 RunMode.OBJECT   -> createObjectRunner().also { it.start() }
                 else -> null
@@ -439,19 +623,49 @@ class AppViewModel @Inject constructor(
     /* ---------- SIGNAL ---------- */
     private fun createSignalRunner(): InferenceRunner<SignalState> {
         val cfg = ModelConfig(
-            "models/hgnetv2_b3.ssld_stage2_ft_in1k_fp32.tflite",
+            "models/hgnetv2_b3.ssld_stage2_ft_in1k_fp32.v4.tflite",
             288, 288, TaskType.CLASSIFICATION
         )
         val proc = SignalClassificationProcessor(cfg, ws) { st ->
             viewModelScope.launch {
-                mutex.withLock {
-                    if (lastStates.size == 3) lastStates.removeFirst()
-                    lastStates.addLast(st)
+                // デバッグ表示（画面の SignalDebugPanel に出る）
+                val dbg = "pred=$st | red=$redCount green=$greenCount none=$noneStreak stable=$stableSignal"
+                _signalDebugLines.update { prev -> (prev + dbg).takeLast(20) }
+                Timber.i("SIGNAL-FSM: %s", dbg)
+
+                when (st) {
+                    SignalState.RED -> {
+                        redCount += 1
+                        greenCount = 0
+                        noneStreak = 0
+                        if (stableSignal != SignalState.RED && redCount >= 2) {
+                            transitionTo(SignalState.RED)
+                        }
+                    }
+                    SignalState.GREEN -> {
+                        greenCount += 1
+                        redCount = 0
+                        noneStreak = 0
+                        if (stableSignal != SignalState.GREEN && greenCount >= 2) {
+                            transitionTo(SignalState.GREEN)
+                        }
+                    }
+                    SignalState.NONE -> {
+                        noneStreak += 1
+                        if (noneStreak >= 3) {
+                            redCount = 0
+                            greenCount = 0
+                            if (stableSignal != SignalState.NONE) {
+                                transitionTo(SignalState.NONE)
+                            }
+                        }
+                    }
                 }
             }
         }
         return InferenceRunner(viewModelScope, jpegFlow, cfg, proc, modelManager)
     }
+
 
     /* ---------- STRAIGHT ---------- */
     private fun createStraightRunner(): InferenceRunner<Float> {
