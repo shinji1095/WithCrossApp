@@ -45,6 +45,20 @@ struct Ctx {
 };
 static Ctx* g_ctx = nullptr;
 
+// ---- counters ----
+static std::atomic<uint64_t> g_cnt_src{0}, g_cnt_jb_in{0}, g_cnt_jb_out{0}, g_cnt_depay{0}, g_cnt_sink{0};
+
+static GstPadProbeReturn on_probe_count(GstPad*, GstPadProbeInfo*, gpointer tag) {
+    const char* name = static_cast<const char*>(tag);
+    if      (!strcmp(name, "src"))    g_cnt_src++;
+    else if (!strcmp(name, "jb-in"))  g_cnt_jb_in++;
+    else if (!strcmp(name, "jb-out")) g_cnt_jb_out++;
+    else if (!strcmp(name, "depay"))  g_cnt_depay++;
+    else if (!strcmp(name, "sink"))   g_cnt_sink++;
+    return GST_PAD_PROBE_OK;
+}
+
+
 /* ---------- helpers ---------- */
 static JNIEnv* getEnv() {
     JNIEnv* env = nullptr;
@@ -79,6 +93,21 @@ static void pushStats() {
     env->CallVoidMethod(g_obj, g_midOnStats, fps, g_ctx->avg, g_ctx->jitter, desc);
     env->DeleteLocalRef(desc);
     if (env->ExceptionCheck()) { env->ExceptionClear(); }
+}
+
+static gboolean poll_rtp_metrics(gpointer) {
+    uint64_t src  = g_cnt_src.exchange(0);
+    uint64_t jbi  = g_cnt_jb_in.exchange(0);
+    uint64_t jbo  = g_cnt_jb_out.exchange(0);
+    uint64_t dep  = g_cnt_depay.exchange(0);
+    uint64_t sink = g_cnt_sink.exchange(0);
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "RTP-METRICS src=%llu/s jb-in=%llu/s jb-out=%llu/s depay=%llu/s sink=%llu/s",
+             (unsigned long long)src, (unsigned long long)jbi, (unsigned long long)jbo,
+             (unsigned long long)dep, (unsigned long long)sink);
+    callDebug(buf);
+    return TRUE;
 }
 
 /* ---------- appsink callback ---------- */
@@ -168,20 +197,20 @@ static bool build_udp_pipeline_ex(int port, bool raw_rgba, int jb_latency_ms, bo
         return false;
     }
 
-    // udpsrc caps & socket
+    // udpsrc caps & socket（★ 後追いを作らないよう buffer-size を縮小）
     {
         GstCaps* caps = gst_caps_from_string(
                 "application/x-rtp,media=video,encoding-name=JPEG,payload=26,clock-rate=90000");
         g_object_set(g_ctx->udpsrc,
                      "port", port,
                      "address", "0.0.0.0",
-                     "buffer-size", 2*1024*1024,
+                     "buffer-size", 512*1024,      // ★ 2MB → 512KB に縮小
                      "caps", caps,
                      NULL);
         gst_caps_unref(caps);
     }
 
-    // appsink setup
+    // appsink setup（既存の鮮度優先：1バッファ・drop）
     g_object_set(g_ctx->appsink,
                  "emit-signals", TRUE,
                  "sync", FALSE,
@@ -190,13 +219,27 @@ static bool build_udp_pipeline_ex(int port, bool raw_rgba, int jb_latency_ms, bo
                  NULL);
     g_signal_connect(g_ctx->appsink, "new-sample", G_CALLBACK(on_new_sample), nullptr);
 
-    // jitterbuffer (optional)
+    // jitterbuffer (optional)（★ 鮮度優先のプロパティを追加・プロパティ有無は安全に確認）
     if (use_jitter) {
         g_ctx->jb = gst_element_factory_make("rtpjitterbuffer", "jb");
         if (!g_ctx->jb) {
             callDebug("rtpjitterbuffer not present → continue without it");
         } else {
-            g_object_set(g_ctx->jb, "latency", jb_latency_ms, NULL);
+            // latency
+            if (g_object_class_find_property(G_OBJECT_GET_CLASS(g_ctx->jb), "latency"))
+                g_object_set(g_ctx->jb, "latency", jb_latency_ms, NULL);
+
+            // drop-on-late / do-lost
+            if (g_object_class_find_property(G_OBJECT_GET_CLASS(g_ctx->jb), "drop-on-late"))
+                g_object_set(g_ctx->jb, "drop-on-late", TRUE, NULL);
+            if (g_object_class_find_property(G_OBJECT_GET_CLASS(g_ctx->jb), "do-lost"))
+                g_object_set(g_ctx->jb, "do-lost", TRUE, NULL);
+
+            // misorder/dropout 許容時間を短く（大きな乱順・欠損は早めに捨てる）
+            if (g_object_class_find_property(G_OBJECT_GET_CLASS(g_ctx->jb), "max-dropout-time"))
+                g_object_set(g_ctx->jb, "max-dropout-time", 200, NULL);  // ms
+            if (g_object_class_find_property(G_OBJECT_GET_CLASS(g_ctx->jb), "max-misorder-time"))
+                g_object_set(g_ctx->jb, "max-misorder-time", 100, NULL); // ms
         }
     }
 
@@ -238,6 +281,35 @@ static bool build_udp_pipeline_ex(int port, bool raw_rgba, int jb_latency_ms, bo
         }
     }
 
+    // ★ ここから RTP-METRICS 用 pad probe を装着（既存機能を壊さない範囲で追加）
+    {
+        // udpsrc src
+        GstPad* p = gst_element_get_static_pad(g_ctx->udpsrc, "src");
+        if (p) { gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, on_probe_count, (gpointer)"src", NULL);
+            gst_object_unref(p); }
+    }
+    if (g_ctx->jb) {
+        // jitterbuffer sink/src
+        GstPad* ps = gst_element_get_static_pad(g_ctx->jb, "sink");
+        if (ps) { gst_pad_add_probe(ps, GST_PAD_PROBE_TYPE_BUFFER, on_probe_count, (gpointer)"jb-in", NULL);
+            gst_object_unref(ps); }
+        GstPad* po = gst_element_get_static_pad(g_ctx->jb, "src");
+        if (po) { gst_pad_add_probe(po, GST_PAD_PROBE_TYPE_BUFFER, on_probe_count, (gpointer)"jb-out", NULL);
+            gst_object_unref(po); }
+    }
+    {
+        // depay src
+        GstPad* p = gst_element_get_static_pad(g_ctx->depay, "src");
+        if (p) { gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, on_probe_count, (gpointer)"depay", NULL);
+            gst_object_unref(p); }
+    }
+    {
+        // appsink sink（new-sample直前）
+        GstPad* p = gst_element_get_static_pad(g_ctx->appsink, "sink");
+        if (p) { gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, on_probe_count, (gpointer)"sink", NULL);
+            gst_object_unref(p); }
+    }
+
     // text for log
     g_ctx->pipeline_desc =
             std::string("udpsrc(port=") + std::to_string(port) + ") ! " +
@@ -257,27 +329,31 @@ static void run_loop() {
 
     gst_element_set_state(g_ctx->pipeline, GST_STATE_PLAYING);
 
-    // state transition log (best effort)
+    // best-effort で状態遷移を拾う（既存通り）
     GstState state = GST_STATE_NULL, pending = GST_STATE_VOID_PENDING;
     gst_element_get_state(g_ctx->pipeline, &state, &pending, GST_CLOCK_TIME_NONE);
     callDebug("GST set PLAYING");
 
-    // drive stats periodically (~1s)
-    guint timer = g_timeout_add_seconds(1, [](gpointer) -> gboolean {
+    // ★ 1秒ごとに pushStats（既存）＋ RTP-METRICS を追加
+    guint t_stats = g_timeout_add_seconds(1, [](gpointer) -> gboolean {
         pushStats();
         return TRUE;
     }, nullptr);
+    guint t_rtp = g_timeout_add_seconds(1, poll_rtp_metrics, nullptr); // ★ 追加
 
     g_main_loop_run(g_ctx->loop);
 
-    if (timer) g_source_remove(timer);
+    if (t_rtp)   g_source_remove(t_rtp);
+    if (t_stats) g_source_remove(t_stats);
+
     gst_element_set_state(g_ctx->pipeline, GST_STATE_NULL);
     if (g_ctx->pipeline) gst_object_unref(g_ctx->pipeline);
-    if (g_ctx->loop) g_main_loop_unref(g_ctx->loop);
+    if (g_ctx->loop)     g_main_loop_unref(g_ctx->loop);
 
     delete g_ctx;
     g_ctx = nullptr;
 }
+
 
 /* ---------- JNI ---------- */
 

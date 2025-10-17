@@ -200,7 +200,7 @@ class AppViewModel @Inject constructor(
     data class RgbaFrame(val bytes: ByteArray, val width: Int, val height: Int)
     private val _rgbaFlow = MutableSharedFlow<RgbaFrame>(
         replay = 0,
-        extraBufferCapacity = 8,
+        extraBufferCapacity = 2,
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
     val rgbaFlow: SharedFlow<RgbaFrame> = _rgbaFlow.asSharedFlow()
@@ -638,7 +638,7 @@ class AppViewModel @Inject constructor(
                         redCount += 1
                         greenCount = 0
                         noneStreak = 0
-                        if (stableSignal != SignalState.RED && redCount >= 2) {
+                        if (stableSignal != SignalState.RED && redCount >= 1) {
                             transitionTo(SignalState.RED)
                         }
                     }
@@ -646,7 +646,7 @@ class AppViewModel @Inject constructor(
                         greenCount += 1
                         redCount = 0
                         noneStreak = 0
-                        if (stableSignal != SignalState.GREEN && greenCount >= 2) {
+                        if (stableSignal != SignalState.GREEN && greenCount >= 1) {
                             transitionTo(SignalState.GREEN)
                         }
                     }
